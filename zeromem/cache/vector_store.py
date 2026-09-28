@@ -38,7 +38,7 @@ class SemanticCache:
             name=COLLECTION_NAME,
             metadata={"hnsw:space": "cosine"},
         )
-        self.embedder = SentenceTransformer(embedding_model)
+        self.embedder = SentenceTransformer(embedding_model, local_files_only=True)  # no downloads while running
 
     @staticmethod
     def _chunk_id(source_url: str, chunk_index: int, text: str) -> str:

@@ -335,4 +335,32 @@ for zm in (True, False):
     log.clear(); b = p.ask("Who won the cricket world cup?")
     assert not b.answered and not log and b.route == "docs", (b, log)
 print("documents mode (both modes): answered from", a.source_url, "| unrelated question refused, 0 web calls")
+
+# ---- models load only from this computer: no Hugging Face calls while running ----
+import os
+assert os.environ.get("HF_HUB_OFFLINE") == "1" and os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+calls = []
+class MissingCE:  # like sentence_transformers.CrossEncoder when the model was never downloaded
+    def __init__(self, name, device=None, local_files_only=False):
+        calls.append(local_files_only); raise OSError("not in local cache")
+sys.modules["sentence_transformers"] = types.SimpleNamespace(CrossEncoder=MissingCE)
+from zeromem.scraper.lexical import LexicalRanker
+p = P.Pipeline(verbose=False, zeromem_only=True)
+assert isinstance(p.reranker, LexicalRanker) and calls == [True], calls
+p = P.Pipeline(verbose=False, zeromem_only=False)
+try:
+    p.reranker; raise AssertionError("full system must explain a missing MiniLM")
+except RuntimeError as e:
+    assert "--zeromem-only" in str(e)
+class BrokenCache:
+    def __init__(self, *a, **k): raise OSError("bge-small not on this computer")
+sys.modules["zeromem.cache.vector_store"] = types.SimpleNamespace(SemanticCache=BrokenCache)
+class EiffelReader:
+    def read(s, q, t): return types.SimpleNamespace(verdict="KNOW", quote="It was designed by Gustave Eiffel for the fair.",
+                                                    verified=True, raw="", seconds=0.1)
+p = P.Pipeline(verbose=False, zeromem_only=True); p._reader, p._reranker = EiffelReader(), FakeRerank()
+P.wiki_chunks = fake_wiki; wiki_mode["v"] = "good"
+a = p.ask("Who designed the Eiffel Tower?")
+assert a.answered and p.use_cache is False, (a, p.use_cache)
+print("offline models: local files only; missing MiniLM -> keyword ranking (ZeroMem-only) or clear error; cache turns itself off")
 print("\nALL TESTS PASSED")
