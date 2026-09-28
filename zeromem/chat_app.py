@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import queue
 import re
@@ -21,8 +22,9 @@ import threading
 import time
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import asdict
+from html import escape as htmlesc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from zeromem.pipeline import Pipeline
 from zeromem.scraper.router import ROUTES
@@ -74,14 +76,13 @@ button:disabled{opacity:.4;cursor:default}
 <div id="log"><div class="wrap" id="wrap">
  <div class="empty" id="empty"><p>Ask a question. ZeroMem picks where to look, reads, and quotes a verified sentence with its source.</p>
   <p class="about">__ABOUT__</p>
-  <div><span class="ex">Who designed the Eiffel Tower?</span><span class="ex">How do I reverse a list in Python?</span>
-  <span class="ex">latest news on Chandrayaan</span><span class="ex">how to make rasam</span></div></div>
+  <div id="exs"></div></div>
 </div></div>
 <form id="f"><div class="bar"><input id="q" autocomplete="off" placeholder="Ask anything factual..." autofocus><button id="b">Ask</button></div>
 <div class="hint">Say <b>next</b> or <b>more</b> to keep reading the last source &middot; Routes: <b style="color:var(--wiki)">wiki</b> facts &middot; <b style="color:var(--code)">code</b> docs &amp; Q&amp;A &middot; <b style="color:var(--news)">news</b> trusted outlets &middot; <b style="color:var(--web)">web</b> everything else &middot; <b style="color:var(--cache)">cache</b> asked before</div></form>
 <script>
 const wrap=document.getElementById('wrap'),log=document.getElementById('log'),f=document.getElementById('f'),q=document.getElementById('q'),b=document.getElementById('b');
-const MODES=__MODES__;let mode=MODES[0].id;
+const MODES=__MODES__;let mode=MODES[0].id;const EXAMPLES=__EXAMPLES__;
 const sid=Math.random().toString(36).slice(2,12);
 const modesEl=document.getElementById('modes'),tagEl=document.getElementById('tag');
 function setMode(id){mode=id;const m=MODES.find(x=>x.id===id);tagEl.innerHTML=m.tag;
@@ -89,10 +90,14 @@ function setMode(id){mode=id;const m=MODES.find(x=>x.id===id);tagEl.innerHTML=m.
 if(MODES.length>1)MODES.forEach(m=>{const b=document.createElement('button');b.type='button';b.textContent=m.label;b.dataset.id=m.id;b.onclick=()=>setMode(m.id);modesEl.appendChild(b)});
 else modesEl.remove();
 setMode(mode);
+const srcHref=u=>u.startsWith('doc://')?'/doc/'+u.slice(6):u;
+const srcText=u=>{if(!u.startsWith('doc://'))return u;const[f,pg]=u.slice(6).split('#page=');const n=decodeURIComponent(f),p=decodeURIComponent(pg||'');return n+(p?(/^\d+$/.test(p)?' · page '+p:' · '+p):'');};
+const srcHost=u=>u.startsWith('doc://')?srcText(u):new URL(u).hostname;
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const down=()=>log.scrollTop=log.scrollHeight;
 const stepfmt=t=>esc(t).replace(/\s(\d{1,2})\.(?=\s?[A-Z])/g,'<br>$1. ');
 const fmt=t=>t.includes('```')?t.split('```').map((p,i)=>i%2?`<pre class="codeblock">${esc(p.replace(/^\n|\n$/g,''))}</pre>`:(p.trim()?`<div class="ctitle">${esc(p.trim())}</div>`:'')).join(''):`&ldquo;${stepfmt(t)}&rdquo;`;
+document.getElementById('exs').innerHTML=EXAMPLES.map(x=>`<span class="ex">${esc(x)}</span>`).join('');
 document.querySelectorAll('.ex').forEach(e=>e.onclick=()=>{q.value=e.textContent;f.requestSubmit()});
 f.onsubmit=e=>{e.preventDefault();const text=q.value.trim();if(!text||b.disabled)return;
  document.getElementById('empty')?.remove();
@@ -111,12 +116,12 @@ f.onsubmit=e=>{e.preventDefault();const text=q.value.trim();if(!text||b.disabled
      (a.answered?(a.confidence==='in-source'?`<span class="chip ok">in source</span><span class="chip fb">written by zeromem</span>`:a.confidence==='not-in-source'?`<span class="chip no">not in source</span><span class="chip fb">written by zeromem</span>`:a.confidence==='verified'?`<span class="chip ok">verified</span>`:`<span class="chip low">low confidence</span><span class="chip fb">picked by ${a.picked_by}</span>`):`<span class="chip no">no verified answer</span>`)+`<span class="chip fb">${a.seconds.toFixed(1)}s</span>`}
    let body;
    if(a.smalltalk)body=`<div class="ans">${esc(a.text)}</div>`;
-   else if(a.answered)body=(a.resolved?`<div class="resolved">understood as: <i>${esc(a.resolved)}</i></div>`:'')+`<div class="ans">${fmt(a.text)}</div>${a.confidence==='low'?`<div class="note">${a.text.includes('```')?'Code copied as-is from the source page. Read it before running it.':'Copied word for word from the source, but ZeroMem did not confirm it answers your question. Check the link.'}</div>`:''}<div class="src"><a href="${esc(a.source_url)}" target="_blank" rel="noopener">${esc(a.source_url)}</a></div>`;
+   else if(a.answered)body=(a.resolved?`<div class="resolved">understood as: <i>${esc(a.resolved)}</i></div>`:'')+`<div class="ans">${fmt(a.text)}</div>${a.confidence==='low'?`<div class="note">${a.text.includes('```')?'Code copied as-is from the source page. Read it before running it.':'Copied word for word from the source, but ZeroMem did not confirm it answers your question. Check the link.'}</div>`:''}<div class="src"><a href="${esc(srcHref(a.source_url))}" target="_blank" rel="noopener">${esc(srcText(a.source_url))}</a></div>`;
    else if(a.readings&&a.readings.length)body=`<div class="ans none">ZeroMem said REFUSE for every chunk it read.</div>`;
    else body=`<div class="ans none">I couldn't verify an answer in the sources I read${a.considered.length?'':' (no usable pages were retrieved)'}.</div>`+
-     (a.considered.length?`<div class="src">${[...new Set(a.considered.map(c=>c[0]))].map(u=>`<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u)}</a>`).join('<br>')}</div>`:'');
+     (a.considered.length?`<div class="src">${[...new Set(a.considered.map(c=>c[0]))].map(u=>`<a href="${esc(srcHref(u))}" target="_blank" rel="noopener">${esc(srcText(u))}</a>`).join('<br>')}</div>`:'');
    if(a.confidence==='not-in-source')body=body.replace('<div class="src">','<div class="note bad">ZeroMem wrote this, but this exact sentence is not in the page. It may be reworded or made up.</div><div class="src">');
-   if(a.readings&&a.readings.length)body+=`<details open><summary>What ZeroMem wrote for each chunk (${a.readings.length})</summary><ul class="rd">${a.readings.map(r=>`<li><span class="chip ${r.verdict==='REFUSE'?'fb':r.in_source?'ok':'no'}">${r.verdict==='REFUSE'?'refuse':r.in_source?'in source':r.verdict==='KNOW'?'not in source':'malformed'}</span> <span class="dom">${esc(new URL(r.url).hostname)}</span>${r.verdict==='REFUSE'?'':`<div>${esc(r.text)}</div>`}</li>`).join('')}</ul></details>`;
+   if(a.readings&&a.readings.length)body+=`<details open><summary>What ZeroMem wrote for each chunk (${a.readings.length})</summary><ul class="rd">${a.readings.map(r=>`<li><span class="chip ${r.verdict==='REFUSE'?'fb':r.in_source?'ok':'no'}">${r.verdict==='REFUSE'?'refuse':r.in_source?'in source':r.verdict==='KNOW'?'not in source':'malformed'}</span> <span class="dom">${esc(srcHost(r.url))}</span>${r.verdict==='REFUSE'?'':`<div>${esc(r.text)}</div>`}</li>`).join('')}</ul></details>`;
    bot.innerHTML=`<div class="chips">${chips}</div>${body}`+(steps.length?`<details><summary>How I got this (${steps.length} steps)</summary><pre class="steps">${esc(steps.join('\n'))}</pre></details>`:'');
    b.disabled=false;q.focus();down()});
  es.addEventListener('fail',ev=>{es.close();bot.classList.remove('live');bot.innerHTML=`<div class="chips"><span class="chip no">error</span></div><div class="ans none">${esc(JSON.parse(ev.data))}</div>`;b.disabled=false});
@@ -137,6 +142,7 @@ class ChatServer:
         self.hits: dict[str, deque] = defaultdict(deque)
         self.waiting = 0
         self.meta = threading.Lock()
+        self.docs = None  # DocIndex when answering from documents (serves /doc/<file>)
 
     def admit(self, ip: str) -> str | None:
         """None if this request may run, else the reason it can't (public mode only)."""
@@ -186,6 +192,18 @@ def make_handler(server: ChatServer):
                 body = PAGE.encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if url.path.startswith("/doc/") and server.docs is not None:
+                path = server.docs.path_of(unquote(url.path[5:]))  # only files that were loaded
+                if not path:
+                    self.send_error(404)
+                    return
+                body = path.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "application/octet-stream")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -259,6 +277,9 @@ def main() -> None:
                     help="pointer model: answer only when P(KNOW) >= this (higher = refuses more, fewer wrong answers)")
     ap.add_argument("--zeromem-only", action="store_true",
                     help="TEST MODE: scraped chunks go into ZeroMem and whatever it writes is shown")
+    ap.add_argument("--docs", nargs="+", default=None, metavar="PATH",
+                    help="answer ONLY from these files/folders (PDF, scans and photos via OCR, Word, PowerPoint, "
+                         "Excel, CSV, text, HTML); no web search")
     args = ap.parse_args()
     if args.lite:
         args.public = True
@@ -267,9 +288,17 @@ def main() -> None:
         torch.set_num_threads(max(1, min(2, os.cpu_count() or 1)))
 
     use_cache = not (args.no_cache or args.public)  # a public server keeps no local cache
+    docs = None
+    if args.docs:
+        from zeromem.docs.index import DocIndex
+        print("Reading your documents ...", flush=True)
+        docs = DocIndex(args.docs)
+        print(docs.summary(), flush=True)
+        if not docs.chunks:
+            raise SystemExit("No readable text found in --docs. Check the paths and the messages above.")
     make = lambda zm: Pipeline(args.provider, args.ckpt, args.device, use_cache=use_cache, k=args.k, route=args.route,
                                zeromem_only=zm, reader=args.reader, min_know=args.min_know,
-                               ranker="bm25" if args.lite else "cross-encoder")
+                               ranker="bm25" if args.lite else "cross-encoder", docs=docs)
     if args.lite:
         zm = make(True)
         print("Loading ZeroMem ...", flush=True)
@@ -294,16 +323,30 @@ def main() -> None:
         modes = [{"id": mid, "label": "", "tag": TAG_ZM if args.zeromem_only else TAG_FULL}]
         server = ChatServer(pipes)
 
+    server.docs = docs
+    examples = ["Who designed the Eiffel Tower?", "How do I reverse a list in Python?", "latest news on Chandrayaan",
+                "how to make rasam"]
+    if docs is not None:
+        n_files = len(docs.files)
+        where = f"answers only from your documents ({n_files} file{'s' if n_files != 1 else ''}), no web search"
+        for m in modes:
+            m["tag"] = (TAG_ZM.split(" &middot; ")[0] + " &middot; " + where) if m["id"] == "zeromem" else where
+        examples = ["Who is the CEO?", "How many days of paid leave do employees get?",
+                    "What was the revenue in FY 2025-26?", "How long must passwords be?"]
     repo = os.environ.get("REPO_URL", "").strip()
     about = ("ZeroMem is a small language model (about 34M parameters) trained from scratch on a laptop. "
              "It never answers from memory: it reads web pages and points at the sentence that answers, "
              "or refuses." + (f' <a href="{repo}" target="_blank" rel="noopener">Source code</a>' if repo else ""))
     global PAGE
-    PAGE = PAGE.replace("__MODES__", json.dumps(modes)).replace("__ABOUT__", about)
+    if docs is not None:
+        about = htmlesc("ZeroMem is reading only your documents: " + ", ".join(f.name for f in docs.files[:4])
+                        + (" and more" if len(docs.files) > 4 else "") + ". If they don't answer a question, it says so.")
+    PAGE = PAGE.replace("__MODES__", json.dumps(modes)).replace("__ABOUT__", about).replace("__EXAMPLES__", json.dumps(examples))
     host = args.host or ("0.0.0.0" if args.public else "127.0.0.1")
     httpd = ThreadingHTTPServer((host, args.port), make_handler(server))
     print(f"ZeroMem chat on http://{'localhost' if host == '127.0.0.1' else host}:{args.port}  "
           f"(modes: {', '.join(pipes)}; route={args.route}, provider={args.provider}, min-know {args.min_know}"
+          f"{f', DOCUMENTS ONLY ({len(docs.files)} files)' if docs is not None else ''}"
           f"{', PUBLIC: rate-limited, no cache' if args.public else ''}{', LITE' if args.lite else ''})  Ctrl+C to stop",
           flush=True)
     try:
