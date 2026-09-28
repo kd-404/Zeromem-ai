@@ -32,3 +32,6 @@ chroma_db/
 
 # run logs (regenerable)
 logs/
+
+# deploy build output
+build/

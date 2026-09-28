@@ -1,0 +1,7 @@
+# serving only (torch is installed separately in the Dockerfile, CPU build)
+numpy
+tokenizers>=0.19.0
+requests
+trafilatura
+ddgs
+sentence-transformers>=3.0.0

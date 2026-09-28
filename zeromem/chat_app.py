@@ -14,8 +14,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
+import re
 import threading
+import time
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -36,6 +40,11 @@ PAGE = r"""<!doctype html>
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif;display:flex;flex-direction:column}
 header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:baseline;gap:12px;background:var(--panel)}
 header b{font-size:17px;letter-spacing:-.01em}header span{color:var(--mute);font-size:13px}
+.modes{margin-left:auto;display:flex;border:1px solid var(--line);border-radius:99px;padding:2px;gap:2px}
+.modes button{font:inherit;font-size:12.5px;font-weight:600;padding:5px 12px;border-radius:99px;background:none;color:var(--mute);border:0;cursor:pointer}
+.modes button.on{background:var(--me);color:var(--meink)}
+.about{max-width:560px;margin:14px auto 0;font-size:13px;line-height:1.55}.about a{color:var(--wiki)}
+@media (max-width:640px){header{flex-wrap:wrap}.modes{margin-left:0}}
 #log{flex:1;overflow-y:auto;padding:24px 16px}
 .wrap{max-width:760px;margin:0 auto;display:flex;flex-direction:column;gap:18px}
 .me{align-self:flex-end;background:var(--me);color:var(--meink);padding:10px 14px;border-radius:16px 16px 4px 16px;max-width:80%}
@@ -61,9 +70,10 @@ button:disabled{opacity:.4;cursor:default}
 .empty{color:var(--mute);text-align:center;margin-top:12vh}
 .empty p{margin:6px}.ex{display:inline-block;margin:4px;padding:6px 10px;border:1px solid var(--line);border-radius:99px;cursor:pointer;font-size:13px;color:var(--ink);background:var(--panel)}
 </style></head><body>
-<header><b>ZeroMem</b><span>__TAGLINE__</span></header>
+<header><b>ZeroMem</b><span id="tag"></span><div class="modes" id="modes"></div></header>
 <div id="log"><div class="wrap" id="wrap">
  <div class="empty" id="empty"><p>Ask a question. ZeroMem picks where to look, reads, and quotes a verified sentence with its source.</p>
+  <p class="about">__ABOUT__</p>
   <div><span class="ex">Who designed the Eiffel Tower?</span><span class="ex">How do I reverse a list in Python?</span>
   <span class="ex">latest news on Chandrayaan</span><span class="ex">how to make rasam</span></div></div>
 </div></div>
@@ -71,6 +81,14 @@ button:disabled{opacity:.4;cursor:default}
 <div class="hint">Say <b>next</b> or <b>more</b> to keep reading the last source &middot; Routes: <b style="color:var(--wiki)">wiki</b> facts &middot; <b style="color:var(--code)">code</b> docs &amp; Q&amp;A &middot; <b style="color:var(--news)">news</b> trusted outlets &middot; <b style="color:var(--web)">web</b> everything else &middot; <b style="color:var(--cache)">cache</b> asked before</div></form>
 <script>
 const wrap=document.getElementById('wrap'),log=document.getElementById('log'),f=document.getElementById('f'),q=document.getElementById('q'),b=document.getElementById('b');
+const MODES=__MODES__;let mode=MODES[0].id;
+const sid=Math.random().toString(36).slice(2,12);
+const modesEl=document.getElementById('modes'),tagEl=document.getElementById('tag');
+function setMode(id){mode=id;const m=MODES.find(x=>x.id===id);tagEl.innerHTML=m.tag;
+ modesEl.querySelectorAll('button').forEach(b=>b.classList.toggle('on',b.dataset.id===id));}
+if(MODES.length>1)MODES.forEach(m=>{const b=document.createElement('button');b.type='button';b.textContent=m.label;b.dataset.id=m.id;b.onclick=()=>setMode(m.id);modesEl.appendChild(b)});
+else modesEl.remove();
+setMode(mode);
 const esc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const down=()=>log.scrollTop=log.scrollHeight;
 const stepfmt=t=>esc(t).replace(/\s(\d{1,2})\.(?=\s?[A-Z])/g,'<br>$1. ');
@@ -83,7 +101,7 @@ f.onsubmit=e=>{e.preventDefault();const text=q.value.trim();if(!text||b.disabled
  bot.innerHTML=`<div class="chips"><span class="chip fb dots">working</span></div><pre class="steps"></pre>`;
  wrap.appendChild(bot);down();q.value='';b.disabled=true;
  const steps=[];const pre=bot.querySelector('.steps');
- const es=new EventSource('/ask?q='+encodeURIComponent(text));
+ const es=new EventSource('/ask?q='+encodeURIComponent(text)+'&mode='+mode+'&sid='+sid);
  es.addEventListener('step',ev=>{const line=JSON.parse(ev.data);steps.push(line);pre.textContent=steps.join('\n');
    const m=line.match(/route: (\w+)/);if(m)bot.querySelector('.chips').innerHTML=`<span class="chip ${m[1].toLowerCase()}">${m[1].toLowerCase()}</span><span class="chip fb dots">working</span>`;down()});
  es.addEventListener('answer',ev=>{es.close();const a=JSON.parse(ev.data);bot.classList.remove('live');
@@ -108,18 +126,53 @@ f.onsubmit=e=>{e.preventDefault();const text=q.value.trim();if(!text||b.disabled
 
 
 class ChatServer:
-    def __init__(self, pipeline: Pipeline):
-        self.p = pipeline
-        self.lock = threading.Lock()  # one question at a time: the models are not thread-safe
+    """Runs questions one at a time (the models are not thread-safe). Each visitor (sid) keeps
+    their own conversation memory per mode, so "next" and follow-ups never mix between people."""
 
-    def ask(self, question: str, emit) -> None:
-        with self.lock:
-            self.p._say = lambda msg: [emit("step", line) for line in msg.strip("\n").splitlines() if line.strip()]
-            try:
-                ans = self.p.ask(question)
-                emit("answer", asdict(ans))
-            except Exception as e:  # noqa: BLE001 - show the error in the chat instead of hanging
-                emit("fail", f"{type(e).__name__}: {e}")
+    def __init__(self, pipelines: dict[str, Pipeline], per_minute: int = 0, max_waiting: int = 0):
+        self.pipes = pipelines
+        self.lock = threading.Lock()
+        self.states: OrderedDict = OrderedDict()   # (sid, mode) -> that visitor's last answer
+        self.per_minute, self.max_waiting = per_minute, max_waiting  # 0 = no limit (local use)
+        self.hits: dict[str, deque] = defaultdict(deque)
+        self.waiting = 0
+        self.meta = threading.Lock()
+
+    def admit(self, ip: str) -> str | None:
+        """None if this request may run, else the reason it can't (public mode only)."""
+        with self.meta:
+            if self.per_minute:
+                h, now = self.hits[ip], time.time()
+                while h and now - h[0] > 60:
+                    h.popleft()
+                if len(h) >= self.per_minute:
+                    return f"Slow down a little: {self.per_minute} questions per minute. Try again in {int(61 - (now - h[0]))}s."
+                h.append(now)
+            if self.max_waiting and self.waiting >= self.max_waiting:
+                return "ZeroMem is busy answering other people. Try again in a few seconds."
+            self.waiting += 1
+            return None
+
+    def ask(self, question: str, mode: str, sid: str, emit) -> None:
+        p = self.pipes.get(mode) or next(iter(self.pipes.values()))
+        try:
+            with self.lock:
+                key = (sid, mode)
+                p.last = self.states.get(key)
+                p._say = lambda msg: [emit("step", line) for line in msg.strip("\n").splitlines() if line.strip()]
+                try:
+                    ans = p.ask(question)
+                    emit("answer", asdict(ans))
+                except Exception as e:  # noqa: BLE001 - show the error in the chat instead of hanging
+                    emit("fail", f"{type(e).__name__}: {e}")
+                finally:
+                    self.states[key] = p.last
+                    self.states.move_to_end(key)
+                    while len(self.states) > 2000:
+                        self.states.popitem(last=False)
+        finally:
+            with self.meta:
+                self.waiting -= 1
 
 
 def make_handler(server: ChatServer):
@@ -137,16 +190,35 @@ def make_handler(server: ChatServer):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if url.path == "/health":
+                body = b"ok"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if url.path != "/ask":
                 self.send_error(404)
                 return
-            question = (parse_qs(url.query).get("q") or [""])[0].strip()[:500]
+            qs = parse_qs(url.query)
+            question = (qs.get("q") or [""])[0].strip()[:500]
+            mode = (qs.get("mode") or [""])[0]
+            sid = re.sub(r"[^a-z0-9]", "", (qs.get("sid") or ["anon"])[0].lower())[:32] or "anon"
+            # behind a proxy (Hugging Face, Render) the visitor's address is the first X-Forwarded-For entry
+            ip = (self.headers.get("X-Forwarded-For") or self.client_address[0]).split(",")[0].strip()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")  # stream through proxies instead of buffering
             self.end_headers()
+            refused = server.admit(ip)
+            if refused:
+                self.wfile.write(f"event: fail\ndata: {json.dumps(refused)}\n\n".encode())
+                return
             events: queue.Queue = queue.Queue()
-            threading.Thread(target=server.ask, args=(question, lambda k, v: events.put((k, v))), daemon=True).start()
+            threading.Thread(target=server.ask, args=(question, mode, sid, lambda k, v: events.put((k, v))),
+                             daemon=True).start()
             while True:
                 kind, data = events.get()
                 try:
@@ -160,9 +232,19 @@ def make_handler(server: ChatServer):
     return Handler
 
 
+TAG_ZM = '<span class="mode">ZEROMEM ONLY</span> &middot; the model\'s own picks, nothing filtered'
+TAG_FULL = "answers only from sources &middot; every quote is copied word for word"
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 7860)))
+    ap.add_argument("--host", default=None, help="default 127.0.0.1 (this computer only); --public uses 0.0.0.0")
+    ap.add_argument("--public", action="store_true",
+                    help="internet-facing: listen on 0.0.0.0, rate-limit per visitor, ZeroMem-only/full toggle, "
+                         "no local cache, models loaded at startup")
+    ap.add_argument("--per-minute", type=int, default=12, help="--public: questions per visitor per minute")
+    ap.add_argument("--max-waiting", type=int, default=8, help="--public: questions allowed in line at once")
     ap.add_argument("--provider", default="ddgs")
     ap.add_argument("--route", default="auto", choices=("auto",) + ROUTES)
     ap.add_argument("--k", type=int, default=3)
@@ -170,20 +252,42 @@ def main() -> None:
     ap.add_argument("--device", default=None)
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--reader", default="auto", choices=("auto", "pointer", "copy"))
-    ap.add_argument("--min-know", type=float, default=0.5,
+    ap.add_argument("--min-know", type=float, default=float(os.environ.get("MIN_KNOW", 0.5)),
                     help="pointer model: answer only when P(KNOW) >= this (higher = refuses more, fewer wrong answers)")
     ap.add_argument("--zeromem-only", action="store_true",
                     help="TEST MODE: scraped chunks go into ZeroMem and whatever it writes is shown")
     args = ap.parse_args()
-    p = Pipeline(args.provider, args.ckpt, args.device, use_cache=not args.no_cache, k=args.k, route=args.route,
-                 zeromem_only=args.zeromem_only, reader=args.reader,
-                 min_know=args.min_know)
+
+    use_cache = not (args.no_cache or args.public)  # a public server keeps no local cache
+    make = lambda zm: Pipeline(args.provider, args.ckpt, args.device, use_cache=use_cache, k=args.k, route=args.route,
+                               zeromem_only=zm, reader=args.reader, min_know=args.min_know)
+    if args.public:
+        zm, full = make(True), make(False)
+        print("Loading models ...", flush=True)
+        zm._say = full._say = lambda msg: None
+        zm.reader, zm.reranker  # load once at startup ...
+        full._reader, full._reranker = zm._reader, zm._reranker  # ... and share them between both modes
+        pipes = {"zeromem": zm, "full": full}
+        modes = [{"id": "zeromem", "label": "ZeroMem only", "tag": TAG_ZM},
+                 {"id": "full", "label": "Full system", "tag": TAG_FULL}]
+        server = ChatServer(pipes, args.per_minute, args.max_waiting)
+    else:
+        mid = "zeromem" if args.zeromem_only else "full"
+        pipes = {mid: make(args.zeromem_only)}
+        modes = [{"id": mid, "label": "", "tag": TAG_ZM if args.zeromem_only else TAG_FULL}]
+        server = ChatServer(pipes)
+
+    repo = os.environ.get("REPO_URL", "").strip()
+    about = ("ZeroMem is a small language model (about 34M parameters) trained from scratch on a laptop. "
+             "It never answers from memory: it reads web pages and points at the sentence that answers, "
+             "or refuses." + (f' <a href="{repo}" target="_blank" rel="noopener">Source code</a>' if repo else ""))
     global PAGE
-    PAGE = PAGE.replace("__TAGLINE__", '<span class="mode">ZEROMEM-ONLY TEST MODE</span> &middot; the model\'s own answers, nothing filtered'
-                        if args.zeromem_only else "answers only from sources &middot; every quote is copied word for word")
-    httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(ChatServer(p)))
-    print(f"ZeroMem chat on http://localhost:{args.port}  (route={args.route}, provider={args.provider}"
-          f"{', ZEROMEM-ONLY TEST MODE' if args.zeromem_only else ''}, min-know {args.min_know})  Ctrl+C to stop")
+    PAGE = PAGE.replace("__MODES__", json.dumps(modes)).replace("__ABOUT__", about)
+    host = args.host or ("0.0.0.0" if args.public else "127.0.0.1")
+    httpd = ThreadingHTTPServer((host, args.port), make_handler(server))
+    print(f"ZeroMem chat on http://{'localhost' if host == '127.0.0.1' else host}:{args.port}  "
+          f"(modes: {', '.join(pipes)}; route={args.route}, provider={args.provider}, min-know {args.min_know}"
+          f"{', PUBLIC: rate-limited, no cache' if args.public else ''})  Ctrl+C to stop", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
