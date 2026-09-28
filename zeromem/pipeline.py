@@ -173,7 +173,17 @@ def subject_of(question: str) -> str:
     return s or question
 
 
-def resolve_followup(question: str, last_question: str | None, topic: str | None = None) -> str | None:
+_PERSON_PRONOUN = {"he", "she", "him", "her", "his", "hers"}
+_PERSON_TOPIC_Q = re.compile(r"^\s*who\s+(is|was|are|were)\b", re.I)
+
+
+def is_person_question(question: str) -> bool:
+    """'who is actor suriya' introduces a person; 'who designed the Eiffel Tower' is about a thing."""
+    return bool(_PERSON_TOPIC_Q.match(question))
+
+
+def resolve_followup(question: str, last_question: str | None, topic: str | None = None,
+                     topic_is_person: bool | None = None) -> str | None:
     """'when was he born' after 'who is rajinikanth' -> 'when was rajinikanth born'. Only short
     questions with a pronoun count, so a new full question is never rewritten.
     `topic` is the subject the conversation is about (kept across several follow-ups, so
@@ -183,6 +193,13 @@ def resolve_followup(question: str, last_question: str | None, topic: str | None
         return None
     subj = topic or subject_of(last_question)
     if not subj or subj.lower() in question.lower():
+        return None
+    # he/she/his/her only point to a person; it/they/its/their/that only to a thing
+    # ("where is it located?" after "who is the CEO?" is about the company, not the CEO).
+    if topic_is_person is None and last_question:
+        topic_is_person = is_person_question(last_question)
+    pron = _PRONOUN.search(question).group(1).lower()
+    if topic_is_person is not None and (pron in _PERSON_PRONOUN) != topic_is_person:
         return None
     first = [True]
 
@@ -292,6 +309,7 @@ class Pipeline:
         self._reader = self._reranker = self._cache = None
         self.last: dict | None = None  # previous answer: question, url, page text, where it ended, topic
         self._topic: str | None = None
+        self._topic_person: bool = False
 
     # -- lazy loading: don't pay for a model until a step needs it ----------
     @property
@@ -380,7 +398,7 @@ class Pipeline:
         """Get chunks from the source this route points at."""
         if route.name == "docs":
             t = time.time()
-            chunks = self.docs.search(question, n=40)
+            chunks = self.docs.search(question)
             self._say(f"      your documents: {len(chunks)} candidate chunks of {len(self.docs.chunks)} ({time.time() - t:.2f}s)")
             return chunks
         if route.name == "wiki":
@@ -553,7 +571,7 @@ class Pipeline:
                 if at < 0:
                     page, at = hit["text"], 0
                 self.last = {"question": question, "url": hit["url"], "page": page, "end": at + len(hit["text"]),
-                             "confidence": hit["confidence"], "picked_by": "zeromem", "topic": self._topic}
+                             "confidence": hit["confidence"], "picked_by": "zeromem", "topic": self._topic, "person": self._topic_person}
                 ans = Answer(question, True, hit["text"], hit["url"], [], time.time() - t_all, route=route,
                              fell_back=fell_back, confidence=hit["confidence"], picked_by="zeromem", readings=readings,
                              resolved=resolved)
@@ -608,7 +626,8 @@ class Pipeline:
         if self.last and is_continue(question):
             return self._continue(question, t_all)
         last_topic = self.last.get("topic") if self.last else None
-        resolved = resolve_followup(question, self.last["question"] if self.last else None, last_topic)
+        last_person = self.last.get("person") if self.last else None
+        resolved = resolve_followup(question, self.last["question"] if self.last else None, last_topic, last_person)
         if resolved:
             self._say(f"[follow-up] {question!r} -> {resolved!r}")
             question = resolved
@@ -618,6 +637,8 @@ class Pipeline:
             question = expanded
         # A follow-up stays on the conversation's topic; a new question starts a new topic.
         self._topic = (last_topic or subject_of(self.last["question"])) if resolved else subject_of(question)
+        self._topic_person = (last_person if last_person is not None else is_person_question(self.last["question"])) \
+            if resolved else is_person_question(question)
         if self.zeromem_only:
             return self._ask_zeromem(question, t_all, resolved)
         considered: list[tuple[str, float, str]] = []
@@ -634,7 +655,7 @@ class Pipeline:
                 else:
                     end = at + len(hit["text"])
                 self.last = {"question": question, "url": hit["url"], "page": page, "end": end,
-                             "confidence": hit["confidence"], "picked_by": hit["picked_by"], "topic": self._topic}
+                             "confidence": hit["confidence"], "picked_by": hit["picked_by"], "topic": self._topic, "person": self._topic_person}
                 ans = Answer(question, True, hit["text"], hit["url"], considered, time.time() - t_all, route=route,
                              fell_back=fell_back, confidence=hit["confidence"], picked_by=hit["picked_by"],
                              relevance=hit["relevance"], resolved=resolved)
