@@ -19,6 +19,13 @@ sentence-transformers>=3.0.0
 # --- vector store / semantic cache ---
 chromadb>=0.5.0
 
+# --- your documents (chat_app --docs): PDFs, scans/photos (OCR), Excel ---
+pypdf
+pypdfium2                              # renders scanned PDF pages so they can be OCR'd
+openpyxl                               # .xlsx files
+ocrmac ; sys_platform == "darwin"      # OCR with Apple's Vision framework (Mac)
+# anywhere else: brew/apt install tesseract, then pip install pytesseract
+
 # --- serving ---
 fastapi
 uvicorn[standard]

@@ -232,7 +232,12 @@ class Pipeline:
                  use_cache: bool = True, k: int = 3, cache_dir: str = "chroma_db",
                  cache_threshold: float = 0.70, min_relevance: float = 2.0, verbose: bool = True,
                  route: str = "auto", zeromem_only: bool = False, reader: str = "auto",
-                 min_know: float = 0.5, ranker: str = "cross-encoder"):
+                 min_know: float = 0.5, ranker: str = "cross-encoder", docs=None):
+        # docs: a zeromem.docs.index.DocIndex. When set, every question is answered ONLY from those
+        # documents: no web search, no web fallback, no cache. Nothing relevant -> refuse.
+        self.docs = docs
+        if docs is not None:
+            use_cache = False
         # ranker: "cross-encoder" (MiniLM, needs sentence-transformers) or "bm25" (keywords, no model).
         # bm25 scores aren't on the cross-encoder's scale, so only zeromem_only mode should use it.
         if ranker == "bm25" and not zeromem_only:
@@ -315,8 +320,18 @@ class Pipeline:
                   + (f"  [skipped: {why}]" if why else ""))
         return kept
 
+    def _pick_route(self, question: str) -> Route:
+        if self.docs is not None:
+            return Route("docs", f"answering only from your {len(self.docs.files)} document(s)", question)
+        return route_question(question) if self.route == "auto" else forced_route(question, self.route)
+
     def _retrieve(self, question: str, route: Route) -> list[Chunk]:
         """Get chunks from the source this route points at."""
+        if route.name == "docs":
+            t = time.time()
+            chunks = self.docs.search(question, n=40)
+            self._say(f"      your documents: {len(chunks)} candidate chunks of {len(self.docs.chunks)} ({time.time() - t:.2f}s)")
+            return chunks
         if route.name == "wiki":
             t = time.time()
             chunks, ok, reasons = wiki_chunks(route.query)
@@ -511,14 +526,14 @@ class Pipeline:
                 self._say("      no in-source answer from the cache, searching fresh")
             else:
                 self._say("[1/5] cache miss")
-        route = route_question(question) if self.route == "auto" else forced_route(question, self.route)
+        route = self._pick_route(question)
         self._say(f"[2/5] route: {route.name.upper()} ({route.why})")
         self._say(f"[3/5] retrieving from {route.name}")
         chunks = self._retrieve(question, route)
         pool += chunks
         self._store(chunks)
         hit = self._zeromem_read(question, chunks, readings) if chunks else None
-        if (hit and hit["confidence"] == "in-source") or route.name == "web":
+        if (hit and hit["confidence"] == "in-source") or route.name in ("web", "docs"):
             return done(hit, route.name)
         self._say(f"      trying the open web too")
         seen = {c.text for c in chunks}
@@ -607,7 +622,7 @@ class Pipeline:
                 self._say(f"[1/5] cache miss ({self.cache.size():,} chunks stored) ({time.time() - t:.1f}s)")
 
         # 2. route: decide where to look
-        route = route_question(question) if self.route == "auto" else forced_route(question, self.route)
+        route = self._pick_route(question)
         self._say(f"[2/5] route: {route.name.upper()} ({route.why})")
 
         # 3. retrieve from that source
@@ -617,11 +632,11 @@ class Pipeline:
         self._store(chunks)
         if chunks:
             hit = self._read(question, chunks, considered)
-            if hit or route.name == "web":
+            if hit or route.name in ("web", "docs"):
                 return finish(hit, route.name)
             self._say(f"      no verified answer from {route.name}, falling back to the open web")
-        elif route.name == "web":
-            return finish(None, "web")
+        elif route.name in ("web", "docs"):
+            return finish(None, route.name)
         else:
             self._say(f"      {route.name} returned nothing, falling back to the open web")
 

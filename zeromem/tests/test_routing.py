@@ -300,4 +300,39 @@ assert clock_reply("what day comes after monday in a week") is None
 log.clear(); t = mk().ask("what day is today/")
 assert t.smalltalk and "Today is" in t.text and not log, (t, log)
 print("clock:", t.text[:40])
+
+# ---- documents mode: answers only from the given files, never the web ----
+import tempfile
+from pathlib import Path
+from zeromem.docs.index import DocIndex
+tmp = Path(tempfile.mkdtemp())
+(tmp / "handbook.txt").write_text("Company handbook. Every full-time employee receives 24 days of paid annual leave per year. "
+                                  "Employees are also entitled to 12 days of paid sick leave per year. " * 3)
+(tmp / "prices.csv").write_text("Product,Price (INR)\nHeavyweight hoodie,1899\nPolo T-shirt,899\n")
+(tmp / "notes.html").write_text("<html><body><script>x=1</script><p>The canteen serves free lunch on working days.</p></body></html>")
+idx = DocIndex([tmp], verbose=False)
+assert len(idx.files) == 3 and idx.chunks, idx.summary()
+assert "Product: Heavyweight hoodie, Price (INR): 1899." in " ".join(c.text for c in idx.chunks)
+class DocReader:
+    def read_many(s, q, texts):
+        out = []
+        for t in texts:
+            if "leave" in q and "24 days" in t:
+                out.append(types.SimpleNamespace(verdict="KNOW", quote="Every full-time employee receives 24 days of paid annual leave per year.",
+                                                 verified=True, raw="", seconds=0.1, pick="B", prob=0.9))
+            else:
+                out.append(types.SimpleNamespace(verdict="REFUSE", quote=None, verified=False, raw="", seconds=0.1, pick=None, prob=0.1))
+        return out
+class DocRerank:
+    def predict(s, pairs, show_progress_bar=False):
+        return [6.0 if ("leave" in q and "leave" in t) else -3.0 for q, t in pairs]
+for zm in (True, False):
+    p = P.Pipeline(verbose=False, zeromem_only=zm, docs=idx)
+    p._reader, p._reranker, p._cache = DocReader(), DocRerank(), FakeCache()
+    log.clear(); a = p.ask("How many days of paid annual leave do employees get?")
+    assert a.answered and "24 days" in a.text and a.source_url.startswith("doc://handbook.txt") and a.route == "docs", a
+    assert not log, ("documents mode must never search the web", log)
+    log.clear(); b = p.ask("Who won the cricket world cup?")
+    assert not b.answered and not log and b.route == "docs", (b, log)
+print("documents mode (both modes): answered from", a.source_url, "| unrelated question refused, 0 web calls")
 print("\nALL TESTS PASSED")
