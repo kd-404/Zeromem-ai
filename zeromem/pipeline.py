@@ -103,7 +103,8 @@ _SENT = re.compile(r"(?<=[.!?])[\"')\]]*\s+(?=[A-Z0-9\"'(])")
 # How-to questions want steps, not one sentence: their answer is a passage from the page.
 _HOWTO = re.compile(r"^how (to|do i|do you|can i|should i|would i|do we|can we|does one)\b|\b(recipe|recipes|steps|"
                     r"step by step|procedure|instructions|method to|process of|process to|guide to|guide for|how to|"
-                    r"tips (to|for|on)|ways to|best way to|checklist|tutorial)\b", re.I)
+                    r"tips (to|for|on)|ways to|best way to|checklist|tutorial|tell me about|say about|describe|overview of|"
+                    r"summari[sz]e|summary of)\b", re.I)
 # "next", "continue", "more": keep reading the previous answer's page, no new search.
 _CONTINUE = re.compile(r"^(next( steps?| one| part)?|continue|go on|keep going|more|tell me more|and then|then|"
                        r"what next|what's next|whats next|after that|the rest|rest|and|ok next|okay next)$", re.I)
@@ -139,14 +140,15 @@ ACRONYMS = {"CEO": "Chief Executive Officer", "CFO": "Chief Financial Officer", 
             "MD": "Managing Director", "VP": "Vice President", "HR": "Human Resources", "HQ": "head office",
             "WFH": "work from home", "MFA": "multi-factor authentication", "FY": "financial year",
             "PTO": "paid time off", "R&D": "research and development"}
-_ACRO_RE = re.compile(r"(?<![\w&])(" + "|".join(re.escape(k) for k in sorted(ACRONYMS, key=len, reverse=True)) + r")(?![\w&])")
+_ACRO_RE = re.compile(r"(?<![\w&])(" + "|".join(re.escape(k) for k in sorted(ACRONYMS, key=len, reverse=True)) + r")(?![\w&])",
+                      re.I)
 
 
 def expand_acronyms(question: str) -> str:
     """'Who is the CFO?' -> 'Who is the CFO (Chief Financial Officer)?'. Documents usually spell titles
     out, and neither the ranker nor ZeroMem knows that CFO means Chief Financial Officer."""
     def one(m):
-        full = ACRONYMS[m.group(1)]
+        full = ACRONYMS[m.group(1).upper()]
         return m.group(1) if full.lower() in question.lower() else f"{m.group(1)} ({full})"
     return _ACRO_RE.sub(one, question)
 
@@ -211,6 +213,38 @@ def resolve_followup(question: str, last_question: str | None, topic: str | None
         first[0] = False
         return subj + ("'s" if m.group(1).lower() in ("his", "its", "their") else "")
     return _PRONOUN.sub(swap, question, count=1)
+
+
+_THING_POSSESSIVE = re.compile(r"\b(its|their)\b", re.I)
+_THING_SUBJECT = re.compile(r"\b(it|they|them|this|that)\b", re.I)
+
+
+def document_variants(question: str, subject: str | None, alias: str | None) -> list[str]:
+    """Documents mode: what 'it' / 'they' / 'their' can mean when the documents are about one subject.
+    'their working hours' -> 'the working hours' (the documents rarely name the subject next to its
+    attributes). 'where is it located' -> both 'where is Kaveri Loom located' and 'where is the company
+    located' (documents say either, e.g. 'The company was founded in 2014'); the caller tries every
+    variant and keeps the strongest answer. Returns [] when there is nothing to rewrite."""
+    q = question
+    if _THING_POSSESSIVE.search(q):
+        q = _THING_POSSESSIVE.sub("the", q)
+    m = _THING_SUBJECT.search(q)
+    if not m:
+        return [q] if q != question else []
+    names = [n for n in (subject, alias) if n]
+    return [q[:m.start()] + n + q[m.end():] for n in names] or ([q] if q != question else [])
+
+
+def answer_strength(a) -> tuple:
+    """Compare answers to the same question asked different ways: verified beats low confidence
+    beats nothing; then the relevance score (full system) or ZeroMem's confidence (ZeroMem-only)."""
+    if not a.answered or a.smalltalk:
+        return (0, 0.0)
+    rank = {"verified": 3, "in-source": 3, "low": 1, "not-in-source": 0}.get(a.confidence, 1)
+    if a.relevance is not None:
+        return (rank, float(a.relevance))
+    prob = max((r.get("prob") or 0.0 for r in a.readings if r.get("text") == a.text), default=0.0)
+    return (rank, 10.0 * prob)
 
 
 def merge_page(chunks: list[tuple[int, str]]) -> str:
@@ -632,16 +666,20 @@ class Pipeline:
         last_person = self.last.get("person") if self.last else None
         # 1. follow-up: a pronoun that fits the conversation's topic ("his wife" -> "actor suriya's wife")
         resolved = resolve_followup(question, self.last["question"] if self.last else None, last_topic, last_person)
+        if resolved and self.docs is not None and \
+                _PRONOUN.search(question).group(1).lower() not in _PERSON_PRONOUN:
+            resolved = None  # documents mode: it/they/their go to the documents' subject (step 2), not the last topic
         if resolved:
             topic = last_topic or subject_of(self.last["question"])
             person = last_person if last_person is not None else is_person_question(self.last["question"])
         else:
             topic, person = subject_of(question), is_person_question(question)
-        # 2. documents: an 'it' / 'they' with no fitting topic means what the documents are about
-        if not resolved and self.docs is not None and self.docs.main_subject:
-            resolved = resolve_followup(question, None, self.docs.main_subject, topic_is_person=False)
-            if resolved:
-                topic, person = self.docs.main_subject, False
+        # 2. documents: it / they / their (with no person topic) are about what the documents describe
+        variants: list[str] = []
+        if not resolved and self.docs is not None:
+            variants = document_variants(question, self.docs.main_subject, self.docs.subject_alias)
+            if len(variants) == 1:
+                resolved, variants = variants[0], []
         if resolved:
             self._say(f"[follow-up] {question!r} -> {resolved!r}")
             question = resolved
@@ -651,11 +689,30 @@ class Pipeline:
             if fixed != question:
                 self._say(f"[spelling] {question!r} -> {fixed!r}")
                 question = resolved = fixed
+            variants = [self.docs.fix_spelling(v) for v in variants]
         expanded = expand_acronyms(question)
         if expanded != question:
             self._say(f"[abbreviations] {question!r} -> {expanded!r}")
             question = expanded
+        variants = [expand_acronyms(v) for v in variants]
         self._topic, self._topic_person = topic, person
+        if variants:
+            return self._best_of(variants, t_all)
+        return self._answer(question, t_all, resolved)
+
+    def _best_of(self, variants: list[str], t_all: float) -> Answer:
+        """Answer each phrasing and keep the strongest answer (multi-query retrieval)."""
+        tried = []
+        for v in variants:
+            self._say(f"[variant] {v!r}")
+            ans = self._answer(v, t_all, v)
+            tried.append((answer_strength(ans), ans, self.last))
+        strength, best, last = max(tried, key=lambda t: t[0])
+        self.last = last
+        self._say(f"[variants] kept {best.question!r}")
+        return best
+
+    def _answer(self, question: str, t_all: float, resolved: str | None) -> Answer:
         if self.zeromem_only:
             return self._ask_zeromem(question, t_all, resolved)
         considered: list[tuple[str, float, str]] = []

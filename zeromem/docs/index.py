@@ -85,6 +85,12 @@ class DocIndex:
         text = " ".join(c.text for c in self.chunks)
         self.vocab = {w for w in re.findall(r"[a-z][a-z'-]+", text.lower()) if len(w) >= 3}
         self.main_subject = self._main_subject(text)
+        # how the documents refer to their subject in plain words ("The company was founded in 2014")
+        low = text.lower()
+        aliases = {a: low.count(a) for a in ("the company", "the organisation", "the organization", "the firm",
+                                             "the business", "the school", "the university", "the hospital", "the bank")}
+        best = max(aliases, key=aliases.get)
+        self.subject_alias = best if aliases[best] >= 2 else None
 
     @staticmethod
     def _main_subject(text: str) -> str | None:
