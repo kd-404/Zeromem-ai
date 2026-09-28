@@ -200,7 +200,9 @@ class Pipeline:
     def __init__(self, provider: str = "ddgs", ckpt: str | None = None, device: str | None = None,
                  use_cache: bool = True, k: int = 3, cache_dir: str = "chroma_db",
                  cache_threshold: float = 0.70, min_relevance: float = 2.0, verbose: bool = True,
-                 route: str = "auto", zeromem_only: bool = False, reader: str = "auto"):
+                 route: str = "auto", zeromem_only: bool = False, reader: str = "auto",
+                 min_know: float = 0.5):
+        self.min_know = min_know  # pointer reader: answer only when P(KNOW) >= this
         self.reader_kind = reader  # auto | pointer | copy (see reader.make_reader)
         # zeromem_only: TEST MODE. Scraped chunks go into ZeroMem and whatever it writes is the
         # answer: no reranker backup, no relevance bar, no verbatim gate, no passage/code
@@ -226,7 +228,7 @@ class Pipeline:
     def reader(self):
         if self._reader is None:
             from zeromem.reader import make_reader
-            self._reader = make_reader(self.reader_kind, self._ckpt, self._device)
+            self._reader = make_reader(self.reader_kind, self._ckpt, self._device, self.min_know)
             self._say(f"      reader: {type(self._reader).__name__}")
         return self._reader
 
@@ -579,11 +581,13 @@ def main() -> None:
                     help="TEST MODE: show whatever ZeroMem writes; no backup, no relevance bar, no verbatim gate")
     ap.add_argument("--reader", default="auto", choices=("auto", "pointer", "copy"),
                     help="auto = pointer model if checkpoints/pointer/best.pt exists, else the old copy model")
+    ap.add_argument("--min-know", type=float, default=0.5,
+                    help="pointer model: answer only when P(KNOW) >= this (higher = refuses more, fewer wrong answers)")
     args = ap.parse_args()
 
     p = Pipeline(args.provider, args.ckpt, args.device, use_cache=not args.no_cache, k=args.k,
                  min_relevance=args.min_relevance, route=args.route, zeromem_only=args.zeromem_only,
-                 reader=args.reader)
+                 reader=args.reader, min_know=args.min_know)
     if args.question:
         p.ask(" ".join(args.question))
         return
