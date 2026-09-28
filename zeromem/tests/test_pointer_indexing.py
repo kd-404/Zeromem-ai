@@ -16,6 +16,7 @@ class TT(np.ndarray):
     def cpu(self): return self
     def to(self, *a, **k): return self
     def detach(self): return self
+    def clone(self): return self.copy().view(TT)
     def clamp(self, min=None, max=None): return np.clip(self, min, max).view(TT)
     def size(self, d=None): return self.shape if d is None else self.shape[d]
     def item(self): return self.tolist()
@@ -139,6 +140,12 @@ assert out[0].verdict == "KNOW" and out[0].pick == "C" and out[0].quote == lists
 assert out[1].verdict == "REFUSE" and out[1].quote is None, out[1]
 assert out[2].verdict == "KNOW" and out[2].pick in ("A", "B") and out[2].quote in lists[2], out[2]
 assert out[3].verdict == "REFUSE", out[3]
+# a 70+ word "sentence" (a flattened list) can never be the answer, even if the model prefers it
+longs = [["Short opener here.", "Second short line.", " ".join(["name"] * 90) + "."]]
+nl = len(encode_prompt(tok, [render_chunk(longs[0])], q)[0])
+reader.model = OracleModel([(nl - 1, True, nl + 1, 2)])
+lo = reader.read_sentences(q, longs)[0]
+assert lo.verdict == "KNOW" and lo.pick in ("A", "B"), lo
 print(f"reader: picks [C] -> {out[0].quote!r} (p_know {out[0].prob:.2f}) | refuses row 2 | "
       f"out-of-range letter masked -> [{out[2].pick}] | empty chunk -> REFUSE")
 print("\nALL POINTER INDEX TESTS PASSED")
