@@ -165,7 +165,7 @@ class PointerReader:
         return results  # type: ignore[return-value]
 
 
-def make_reader(kind: str = "auto", ckpt: str | None = None, device: str | None = None):
+def make_reader(kind: str = "auto", ckpt: str | None = None, device: str | None = None, min_know: float = 0.5):
     """copy: the old retyping reader. pointer: the pointer reader.
     auto: pointer if --ckpt is a pointer checkpoint (path contains 'pointer'), or, with no
     --ckpt, if checkpoints/pointer/best.pt exists; otherwise the copy reader."""
@@ -173,9 +173,9 @@ def make_reader(kind: str = "auto", ckpt: str | None = None, device: str | None 
     if kind == "copy":
         return ZeroMemReader(ckpt or DEFAULT_CKPT, device=device)
     if kind == "pointer":
-        return PointerReader(ckpt or POINTER_CKPT, device=device)
+        return PointerReader(ckpt or POINTER_CKPT, device=device, min_know=min_know)
     if ckpt:
-        return PointerReader(ckpt, device=device) if "pointer" in ckpt else ZeroMemReader(ckpt, device=device)
+        return PointerReader(ckpt, device=device, min_know=min_know) if "pointer" in ckpt else ZeroMemReader(ckpt, device=device)
     if os.path.exists(POINTER_CKPT):
-        return PointerReader(POINTER_CKPT, device=device)
+        return PointerReader(POINTER_CKPT, device=device, min_know=min_know)
     return ZeroMemReader(DEFAULT_CKPT, device=device)

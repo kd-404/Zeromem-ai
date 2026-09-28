@@ -170,17 +170,20 @@ def main() -> None:
     ap.add_argument("--device", default=None)
     ap.add_argument("--no-cache", action="store_true")
     ap.add_argument("--reader", default="auto", choices=("auto", "pointer", "copy"))
+    ap.add_argument("--min-know", type=float, default=0.5,
+                    help="pointer model: answer only when P(KNOW) >= this (higher = refuses more, fewer wrong answers)")
     ap.add_argument("--zeromem-only", action="store_true",
                     help="TEST MODE: scraped chunks go into ZeroMem and whatever it writes is shown")
     args = ap.parse_args()
     p = Pipeline(args.provider, args.ckpt, args.device, use_cache=not args.no_cache, k=args.k, route=args.route,
-                 zeromem_only=args.zeromem_only, reader=args.reader)
+                 zeromem_only=args.zeromem_only, reader=args.reader,
+                 min_know=args.min_know)
     global PAGE
     PAGE = PAGE.replace("__TAGLINE__", '<span class="mode">ZEROMEM-ONLY TEST MODE</span> &middot; the model\'s own answers, nothing filtered'
                         if args.zeromem_only else "answers only from sources &middot; every quote is copied word for word")
     httpd = ThreadingHTTPServer(("127.0.0.1", args.port), make_handler(ChatServer(p)))
     print(f"ZeroMem chat on http://localhost:{args.port}  (route={args.route}, provider={args.provider}"
-          f"{', ZEROMEM-ONLY TEST MODE' if args.zeromem_only else ''})  Ctrl+C to stop")
+          f"{', ZEROMEM-ONLY TEST MODE' if args.zeromem_only else ''}, min-know {args.min_know})  Ctrl+C to stop")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
