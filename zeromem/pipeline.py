@@ -28,6 +28,15 @@ Usage:
 
 from __future__ import annotations
 
+import os
+
+# Never contact Hugging Face while running: models load only from files already on this computer
+# (downloaded earlier, or baked into a deploy image). Set ZEROMEM_ALLOW_MODEL_DOWNLOAD=1 to let a
+# missing model download once.
+if os.environ.get("ZEROMEM_ALLOW_MODEL_DOWNLOAD") != "1":
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
 import argparse
 import re
 import time
@@ -122,6 +131,24 @@ CACHE_TRUST = 3.0
 PASSAGE_WORDS = 110        # how much a how-to answer / a "next" shows at a time
 
 
+ACRONYMS = {"CEO": "Chief Executive Officer", "CFO": "Chief Financial Officer", "CTO": "Chief Technology Officer",
+            "COO": "Chief Operating Officer", "CIO": "Chief Information Officer", "CMO": "Chief Marketing Officer",
+            "CISO": "Chief Information Security Officer", "CHRO": "Chief Human Resources Officer",
+            "MD": "Managing Director", "VP": "Vice President", "HR": "Human Resources", "HQ": "head office",
+            "WFH": "work from home", "MFA": "multi-factor authentication", "FY": "financial year",
+            "PTO": "paid time off", "R&D": "research and development"}
+_ACRO_RE = re.compile(r"(?<![\w&])(" + "|".join(re.escape(k) for k in sorted(ACRONYMS, key=len, reverse=True)) + r")(?![\w&])")
+
+
+def expand_acronyms(question: str) -> str:
+    """'Who is the CFO?' -> 'Who is the CFO (Chief Financial Officer)?'. Documents usually spell titles
+    out, and neither the ranker nor ZeroMem knows that CFO means Chief Financial Officer."""
+    def one(m):
+        full = ACRONYMS[m.group(1)]
+        return m.group(1) if full.lower() in question.lower() else f"{m.group(1)} ({full})"
+    return _ACRO_RE.sub(one, question)
+
+
 def is_continue(q: str) -> bool:
     return bool(_CONTINUE.match(re.sub(r"[^a-z' ]", "", q.lower()).strip()))
 
@@ -200,8 +227,9 @@ def passage(page: str, start: int, words: int = PASSAGE_WORDS) -> tuple[str, int
 
 def sentences(text: str) -> list[str]:
     """Whole sentences only: chunk edges cut sentences in half, so fragments are dropped."""
+    from zeromem.data.pointer_format import merge_abbreviations
     out = []
-    for s in _SENT.split(text):
+    for s in merge_abbreviations([x.strip() for x in _SENT.split(text) if x.strip()]):
         s = s.strip()
         if len(s.split()) >= 4 and s[0].isupper() and s[-1] in ".!?\"')":
             out.append(s)
@@ -281,8 +309,18 @@ class Pipeline:
                 from zeromem.scraper.lexical import LexicalRanker
                 self._reranker = LexicalRanker()
             else:
-                from sentence_transformers import CrossEncoder
-                self._reranker = CrossEncoder(RERANKER, device="cpu")
+                try:
+                    from sentence_transformers import CrossEncoder
+                    self._reranker = CrossEncoder(RERANKER, device="cpu", local_files_only=True)
+                except Exception as e:  # noqa: BLE001 - not downloaded yet, or package missing
+                    if not self.zeromem_only:
+                        raise RuntimeError(
+                            f"The MiniLM reranker isn't on this computer ({type(e).__name__}). Either run with "
+                            "--zeromem-only (uses keyword ranking instead), or download it once with internet: "
+                            "ZEROMEM_ALLOW_MODEL_DOWNLOAD=1 python -m zeromem.chat_app") from e
+                    from zeromem.scraper.lexical import LexicalRanker
+                    self._say("      MiniLM reranker not on this computer: using keyword ranking (BM25) instead")
+                    self._reranker = LexicalRanker()
         return self._reranker
 
     @property
@@ -291,6 +329,19 @@ class Pipeline:
             from zeromem.cache.vector_store import SemanticCache
             self._cache = SemanticCache(self._cache_dir)
         return self._cache
+
+    def _cache_ready(self) -> bool:
+        """True if the cache can be used. If its embedding model isn't on this computer (or chromadb
+        is missing), the cache is switched off for this session instead of failing every question."""
+        if not self.use_cache:
+            return False
+        try:
+            self.cache
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.use_cache = False
+            self._say(f"      cache off: its embedding model isn't on this computer ({type(e).__name__})")
+            return False
 
     def _say(self, msg: str) -> None:
         if self.verbose:
@@ -514,7 +565,7 @@ class Pipeline:
                 self._say(f"\nZeroMem refused every chunk it read. ({ans.seconds:.1f}s total)")
             return ans
 
-        if self.use_cache:
+        if self._cache_ready():
             hits = self.cache.lookup(question, top_k=20, threshold=self.cache_threshold)
             if hits and len(hits) >= self.k:
                 self._say(f"[1/5] cache HIT: {len(hits)} stored chunks")
@@ -561,6 +612,10 @@ class Pipeline:
         if resolved:
             self._say(f"[follow-up] {question!r} -> {resolved!r}")
             question = resolved
+        expanded = expand_acronyms(question)
+        if expanded != question:
+            self._say(f"[abbreviations] {question!r} -> {expanded!r}")
+            question = expanded
         # A follow-up stays on the conversation's topic; a new question starts a new topic.
         self._topic = (last_topic or subject_of(self.last["question"])) if resolved else subject_of(question)
         if self.zeromem_only:
@@ -603,7 +658,7 @@ class Pipeline:
             return done(hit, route, fell_back)
 
         # 1. cache: questions asked before are answered from stored chunks, no web at all
-        if self.use_cache:
+        if self._cache_ready():
             t = time.time()
             hits = self.cache.lookup(question, top_k=20, threshold=self.cache_threshold)
             if hits and len(hits) >= self.k:

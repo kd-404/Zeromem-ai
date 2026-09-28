@@ -36,6 +36,22 @@ def norm(s: str) -> str:
     return " ".join(s.split())
 
 
+# A full stop after these is part of a name or phrase, not the end of a sentence
+# ("Kaveri Loom Apparel Pvt. Ltd. is a ..." must stay one sentence).
+ABBREV_END = re.compile(r"(?:\b(?:Pvt|Ltd|Inc|Co|Corp|Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|No|Nos|vs|etc|approx|Govt|Dept|"
+                        r"Fig|Vol|Rs|Rev|Gen|Col|Lt|Capt|Mt)|\b[A-Z]|e\.g|i\.e)\.$")
+
+
+def merge_abbreviations(pieces: list[str]) -> list[str]:
+    out: list[str] = []
+    for p in pieces:
+        if out and ABBREV_END.search(out[-1]):
+            out[-1] = out[-1] + " " + p
+        else:
+            out.append(p)
+    return out
+
+
 def split_sentences(chunk: str) -> list[str]:
     """Chunk -> sentences, in order. Lines are split too (scraped pages put menus, headings
     and list items on their own lines). Tiny pieces (<= 3 chars) are dropped."""
@@ -43,10 +59,8 @@ def split_sentences(chunk: str) -> list[str]:
     for line in chunk.split("\n"):
         starts = [0] + [m.end() for m in SENT_SPLIT.finditer(line)]
         ends = starts[1:] + [len(line)]
-        for a, b in zip(starts, ends):
-            s = norm(line[a:b])
-            if len(s) > 3:
-                out.append(s)
+        pieces = [norm(line[a:b]) for a, b in zip(starts, ends)]
+        out += [s for s in merge_abbreviations([x for x in pieces if x]) if len(s) > 3]
     return out[:MAX_SENTENCES]
 
 
