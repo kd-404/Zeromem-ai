@@ -5,18 +5,19 @@ numpy
 # --- tokenizer ---
 tokenizers>=0.19.0
 
-# --- web fetch / scrape ---
+# --- datasets (stage-1 TinyStories, stage-2 SQuAD 2.0 etc.) ---
+datasets
+
+# --- web search / fetch / scrape ---
 requests
 trafilatura
+ddgs  # keyless DuckDuckGo search, no account needed
 
 # --- embeddings + reranker for RAG ---
 sentence-transformers>=3.0.0
 
 # --- vector store / semantic cache ---
 chromadb>=0.5.0
-
-# --- agent brain (Qwen2.5-3B, quantized) ---
-mlx-lm
 
 # --- serving ---
 fastapi

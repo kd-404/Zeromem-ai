@@ -55,18 +55,19 @@ def encode_conversation(messages: list[dict], tokenizer: Tokenizer, max_len: int
     return ids[:max_len], labels[:max_len]
 
 
-def make_batches(examples: list[tuple[list[int], list[int]]], batch_size: int, shuffle: bool):
+def make_batches(examples: list[tuple[list[int], list[int]]], batch_size: int, shuffle: bool, max_len: int = 384):
     order = list(range(len(examples)))
     if shuffle:
         random.shuffle(order)
     for i in range(0, len(order), batch_size):
         chunk = [examples[j] for j in order[i:i + batch_size]]
-        # Round width up to a multiple of 64: only ~6 distinct tensor shapes instead of
-        # one per batch. Varying shapes make MPS re-plan kernels every step (slow, memory-hungry).
-        width = max(len(ids) for ids, _ in chunk)
-        width = ((width + 63) // 64) * 64
-        x = torch.full((len(chunk), width - 1), PAD, dtype=torch.long)
-        y = torch.full((len(chunk), width - 1), PAD, dtype=torch.long)
+        # EVERY batch is exactly (batch_size, max_len - 1): padded rows and columns are all PAD,
+        # which the loss ignores. Varying shapes made the MPS backend cache a kernel set per
+        # shape and the process grew to 6.8GB of an 8GB machine and thrashed (measured). Stage 1
+        # never had this problem because its batches were always one fixed shape.
+        width = max_len
+        x = torch.full((batch_size, width - 1), PAD, dtype=torch.long)
+        y = torch.full((batch_size, width - 1), PAD, dtype=torch.long)
         for r, (ids, labels) in enumerate(chunk):
             n = len(ids) - 1
             x[r, :n] = torch.tensor(ids[:-1])
@@ -75,10 +76,10 @@ def make_batches(examples: list[tuple[list[int], list[int]]], batch_size: int, s
 
 
 @torch.no_grad()
-def eval_loss(model, examples, device, batch_size: int) -> float:
+def eval_loss(model, examples, device, batch_size: int, max_len: int) -> float:
     model.eval()
     total, n = 0.0, 0
-    for x, y in make_batches(examples, batch_size, shuffle=False):
+    for x, y in make_batches(examples, batch_size, shuffle=False, max_len=max_len):
         _, loss = model(x.to(device), targets=y.to(device))
         total += loss.item()
         n += 1
@@ -120,13 +121,15 @@ def main() -> None:
     warmup = 20
     os.makedirs(args.out_dir, exist_ok=True)
 
-    base_val = eval_loss(model, val_ex, device, args.batch_size)
+    base_val = eval_loss(model, val_ex, device, args.batch_size, args.max_len)
     print(f"before fine-tuning: val loss {base_val:.4f}  (stage-1 model has never seen this format)")
 
-    best_val, step, t0 = float("inf"), 0, time.time()
+    # Only save when we beat the checkpoint we started from (so resuming from best.pt can't
+    # overwrite it with something worse).
+    best_val, step, t0 = base_val, 0, time.time()
     for epoch in range(args.epochs):
         run_loss, run_n = 0.0, 0
-        for x, y in make_batches(train_ex, args.batch_size, shuffle=True):
+        for x, y in make_batches(train_ex, args.batch_size, shuffle=True, max_len=args.max_len):
             lr = cosine_lr(step, total_steps, warmup, args.lr, args.lr * 0.1)
             for g in optimizer.param_groups:
                 g["lr"] = lr
@@ -138,11 +141,13 @@ def main() -> None:
             run_loss += loss.item()
             run_n += 1
             step += 1
+            if step % 50 == 0 and device.type == "mps":
+                torch.mps.empty_cache()  # belt and braces against allocator growth
             if step % 25 == 0:
                 print(f"  step {step}/{total_steps} train loss {run_loss / run_n:.4f} "
                       f"elapsed {(time.time() - t0) / 60:.1f}m", flush=True)
 
-        val = eval_loss(model, val_ex, device, args.batch_size)
+        val = eval_loss(model, val_ex, device, args.batch_size, args.max_len)
         print(f"epoch {epoch + 1}/{args.epochs}: train {run_loss / run_n:.4f}  val {val:.4f}"
               f"  (val ppl {math.exp(val):.2f})", flush=True)
         if val < best_val:
