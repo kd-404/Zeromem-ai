@@ -243,6 +243,9 @@ def main() -> None:
     ap.add_argument("--public", action="store_true",
                     help="internet-facing: listen on 0.0.0.0, rate-limit per visitor, ZeroMem-only/full toggle, "
                          "no local cache, models loaded at startup")
+    ap.add_argument("--lite", action="store_true",
+                    help="--public for small servers (Render free, 512 MB): ZeroMem-only mode, keyword ranking "
+                         "instead of the reranker model, 2 chunks per question")
     ap.add_argument("--per-minute", type=int, default=12, help="--public: questions per visitor per minute")
     ap.add_argument("--max-waiting", type=int, default=8, help="--public: questions allowed in line at once")
     ap.add_argument("--provider", default="ddgs")
@@ -257,11 +260,25 @@ def main() -> None:
     ap.add_argument("--zeromem-only", action="store_true",
                     help="TEST MODE: scraped chunks go into ZeroMem and whatever it writes is shown")
     args = ap.parse_args()
+    if args.lite:
+        args.public = True
+        args.k = min(args.k, 2)
+        import torch
+        torch.set_num_threads(max(1, min(2, os.cpu_count() or 1)))
 
     use_cache = not (args.no_cache or args.public)  # a public server keeps no local cache
     make = lambda zm: Pipeline(args.provider, args.ckpt, args.device, use_cache=use_cache, k=args.k, route=args.route,
-                               zeromem_only=zm, reader=args.reader, min_know=args.min_know)
-    if args.public:
+                               zeromem_only=zm, reader=args.reader, min_know=args.min_know,
+                               ranker="bm25" if args.lite else "cross-encoder")
+    if args.lite:
+        zm = make(True)
+        print("Loading ZeroMem ...", flush=True)
+        zm._say = lambda msg: None
+        zm.reader, zm.reranker
+        pipes = {"zeromem": zm}
+        modes = [{"id": "zeromem", "label": "", "tag": TAG_ZM}]
+        server = ChatServer(pipes, args.per_minute, args.max_waiting)
+    elif args.public:
         zm, full = make(True), make(False)
         print("Loading models ...", flush=True)
         zm._say = full._say = lambda msg: None
@@ -287,7 +304,8 @@ def main() -> None:
     httpd = ThreadingHTTPServer((host, args.port), make_handler(server))
     print(f"ZeroMem chat on http://{'localhost' if host == '127.0.0.1' else host}:{args.port}  "
           f"(modes: {', '.join(pipes)}; route={args.route}, provider={args.provider}, min-know {args.min_know}"
-          f"{', PUBLIC: rate-limited, no cache' if args.public else ''})  Ctrl+C to stop", flush=True)
+          f"{', PUBLIC: rate-limited, no cache' if args.public else ''}{', LITE' if args.lite else ''})  Ctrl+C to stop",
+          flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

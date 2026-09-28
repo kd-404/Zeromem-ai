@@ -201,7 +201,12 @@ class Pipeline:
                  use_cache: bool = True, k: int = 3, cache_dir: str = "chroma_db",
                  cache_threshold: float = 0.70, min_relevance: float = 2.0, verbose: bool = True,
                  route: str = "auto", zeromem_only: bool = False, reader: str = "auto",
-                 min_know: float = 0.5):
+                 min_know: float = 0.5, ranker: str = "cross-encoder"):
+        # ranker: "cross-encoder" (MiniLM, needs sentence-transformers) or "bm25" (keywords, no model).
+        # bm25 scores aren't on the cross-encoder's scale, so only zeromem_only mode should use it.
+        if ranker == "bm25" and not zeromem_only:
+            raise ValueError("ranker='bm25' only works with zeromem_only=True (the full system's thresholds need the cross-encoder)")
+        self.ranker_kind = ranker
         self.min_know = min_know  # pointer reader: answer only when P(KNOW) >= this
         self.reader_kind = reader  # auto | pointer | copy (see reader.make_reader)
         # zeromem_only: TEST MODE. Scraped chunks go into ZeroMem and whatever it writes is the
@@ -235,8 +240,12 @@ class Pipeline:
     @property
     def reranker(self):
         if self._reranker is None:
-            from sentence_transformers import CrossEncoder
-            self._reranker = CrossEncoder(RERANKER, device="cpu")
+            if self.ranker_kind == "bm25":  # no model: keyword ranking only (small servers)
+                from zeromem.scraper.lexical import LexicalRanker
+                self._reranker = LexicalRanker()
+            else:
+                from sentence_transformers import CrossEncoder
+                self._reranker = CrossEncoder(RERANKER, device="cpu")
         return self._reranker
 
     @property
