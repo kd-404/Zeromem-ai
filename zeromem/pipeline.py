@@ -61,6 +61,8 @@ INTRO = ("I'm ZeroMem, a small language model built from scratch. I don't answer
 def clean_question(q: str) -> str:
     """Trim stray characters people type by accident (trailing slashes, repeated punctuation)."""
     q = q.strip().strip("/\\|~`<>")
+    # question words glued to the next word by a missed space: "whereis" -> "where is"
+    q = re.sub(r"\b(where|what|who|when|why|how)(is|are|was|were|do|does|did|many|much)\b", r"\1 \2", q, flags=re.I)
     return re.sub(r"[?!.]{2,}$", "?", q).strip()
 
 
@@ -462,8 +464,9 @@ class Pipeline:
                 if getattr(r, "prob", None) is None:
                     break  # copy model: no confidence score, so the first verified answer wins (as before)
         if verified:
-            # pointer model: every chunk was read in one pass, so take its most confident verified pick
-            return max(verified, key=lambda v: v[1] or 0.0)[0]
+            # every chunk was read in one pass: the reranker is the judge in the full system, so the
+            # verified answer it finds MOST relevant wins (ZeroMem's confidence breaks ties)
+            return max(verified, key=lambda v: (round(v[0]["relevance"], 1), v[1] or 0.0))[0]
 
         # Backup: the reranker scores every whole sentence in the chunks ZeroMem just read.
         sents = [(snt, c.source_url) for _, c in top for snt in sentences(c.text)]
@@ -627,18 +630,32 @@ class Pipeline:
             return self._continue(question, t_all)
         last_topic = self.last.get("topic") if self.last else None
         last_person = self.last.get("person") if self.last else None
+        # 1. follow-up: a pronoun that fits the conversation's topic ("his wife" -> "actor suriya's wife")
         resolved = resolve_followup(question, self.last["question"] if self.last else None, last_topic, last_person)
+        if resolved:
+            topic = last_topic or subject_of(self.last["question"])
+            person = last_person if last_person is not None else is_person_question(self.last["question"])
+        else:
+            topic, person = subject_of(question), is_person_question(question)
+        # 2. documents: an 'it' / 'they' with no fitting topic means what the documents are about
+        if not resolved and self.docs is not None and self.docs.main_subject:
+            resolved = resolve_followup(question, None, self.docs.main_subject, topic_is_person=False)
+            if resolved:
+                topic, person = self.docs.main_subject, False
         if resolved:
             self._say(f"[follow-up] {question!r} -> {resolved!r}")
             question = resolved
+        # 3. documents: fix words the documents never use ("manufacuture" -> "manufacturer")
+        if self.docs is not None:
+            fixed = self.docs.fix_spelling(question)
+            if fixed != question:
+                self._say(f"[spelling] {question!r} -> {fixed!r}")
+                question = resolved = fixed
         expanded = expand_acronyms(question)
         if expanded != question:
             self._say(f"[abbreviations] {question!r} -> {expanded!r}")
             question = expanded
-        # A follow-up stays on the conversation's topic; a new question starts a new topic.
-        self._topic = (last_topic or subject_of(self.last["question"])) if resolved else subject_of(question)
-        self._topic_person = (last_person if last_person is not None else is_person_question(self.last["question"])) \
-            if resolved else is_person_question(question)
+        self._topic, self._topic_person = topic, person
         if self.zeromem_only:
             return self._ask_zeromem(question, t_all, resolved)
         considered: list[tuple[str, float, str]] = []

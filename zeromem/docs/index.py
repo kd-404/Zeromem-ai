@@ -15,6 +15,7 @@ pipeline then orders those candidates with its ranker and ZeroMem reads the top 
 from __future__ import annotations
 
 import re
+import difflib
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -81,6 +82,33 @@ class DocIndex:
         self._by_name: dict[str, Path] = {}
         for p in self._expand(paths):
             self._add(p, verbose)
+        text = " ".join(c.text for c in self.chunks)
+        self.vocab = {w for w in re.findall(r"[a-z][a-z'-]+", text.lower()) if len(w) >= 3}
+        self.main_subject = self._main_subject(text)
+
+    @staticmethod
+    def _main_subject(text: str) -> str | None:
+        """The name the documents are mostly about ("Kaveri Loom"): the most frequent pair of
+        capitalised words. 'it' / 'they' in a question with no other topic refers to it."""
+        skip = {"The", "This", "That", "These", "Every", "All", "Each", "Our", "Its", "Their", "A", "An", "In",
+                "On", "For", "Of", "And", "Page", "Note", "Customers", "Employees", "Business", "Company"}
+        pairs = Counter(m for m in re.findall(r"\b([A-Z][a-z]+ [A-Z][a-z]+)\b", text) if m.split()[0] not in skip)
+        if not pairs:
+            return None
+        name, count = pairs.most_common(1)[0]
+        return name if count >= 3 else None
+
+    def fix_spelling(self, question: str) -> str:
+        """Replace words the documents never use with the closest word they do use
+        ("manufacuture" -> "manufacturer"). Short words and known words are left alone."""
+        def fix(m):
+            w = m.group(0)
+            lw = w.lower()
+            if len(lw) < 5 or lw in self.vocab:
+                return w
+            close = difflib.get_close_matches(lw, self.vocab, n=1, cutoff=0.82)
+            return close[0] if close else w
+        return re.sub(r"[A-Za-z][A-Za-z'-]+", fix, question)
 
     @staticmethod
     def _expand(paths):

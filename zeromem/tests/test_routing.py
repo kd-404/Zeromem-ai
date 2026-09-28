@@ -366,5 +366,15 @@ p = P.Pipeline(verbose=False, zeromem_only=True); p._reader, p._reranker = Eiffe
 P.wiki_chunks = fake_wiki; wiki_mode["v"] = "good"
 a = p.ask("Who designed the Eiffel Tower?")
 assert a.answered and p.use_cache is False, (a, p.use_cache)
+# documents: 'it' means the documents' main subject; words fixed against the documents' vocabulary
+(tmp / "co.txt").write_text("Kaveri Loom is a garment manufacturer. Kaveri Loom makes organic cotton T-shirts. "
+                            "The head office of Kaveri Loom is located at 42 Kumaran Road, Tiruppur. " * 3)
+idx2 = DocIndex([tmp / "co.txt"], verbose=False)
+assert idx2.main_subject == "Kaveri Loom", idx2.main_subject
+assert idx2.fix_spelling("what they manufacuture?") == "what they manufacturer?"
+assert P.clean_question("whereis the company located?") == "where is the company located?"
+p = P.Pipeline(verbose=False, zeromem_only=True, docs=idx2); p._reader, p._reranker, p._cache = DocReader(), DocRerank(), FakeCache()
+r = p.ask("where is it located?")
+assert r.resolved == "where is Kaveri Loom located?", r.resolved
 print("offline models: local files only; missing MiniLM -> keyword ranking (ZeroMem-only) or clear error; cache turns itself off")
 print("\nALL TESTS PASSED")
