@@ -25,15 +25,18 @@ def load_model(ckpt_path: str, device: torch.device) -> ZeroMem:
     # weights_only=False: checkpoint embeds a ZeroMemConfig object; it's our own local file.
     # mmap: the weights are read from the file on demand instead of first being copied into
     # memory, so loading doesn't briefly need twice the model's size (matters on 512 MB servers).
+    # Load to CPU first (mmap only works there), then move the finished model to the device.
     try:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False, mmap=True)
-    except (TypeError, RuntimeError):  # older torch, or a checkpoint saved in the legacy format
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    model = ZeroMem(ckpt["config"]).to(device)
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False, mmap=True)
+    except (TypeError, RuntimeError, ValueError):  # older torch, or a checkpoint in the legacy format
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    model = ZeroMem(ckpt["config"])
     model.load_state_dict(ckpt["model"])
-    del ckpt
+    step = ckpt.get("step", 0)
+    del ckpt  # drop the file-backed copy; the model now holds the weights
+    model = model.to(device)
     model.eval()
-    print(f"Loaded {ckpt_path} (trained to step {ckpt['step']:,})")
+    print(f"Loaded {ckpt_path} (trained to step {step:,})")
     return model
 
 
