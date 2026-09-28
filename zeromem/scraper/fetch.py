@@ -121,6 +121,8 @@ def fetch_page(url: str, timeout: float = 10.0) -> tuple[str | None, str, tuple[
                     return None, "not html", ("", [])
                 html = r.raw.read(MAX_BYTES, decode_content=True)
             text = trafilatura.extract(html, include_comments=False, include_tables=False)
+            if text:  # wiki-style "[edit]" links survive extraction and end up inside answers
+                text = re.sub(r"\s*\[edit\]", "", text)
             try:
                 codes = code_blocks(html.decode(r.encoding or "utf-8", errors="replace"))
             except Exception:  # noqa: BLE001 - code extraction is a bonus, never a failure

@@ -94,6 +94,7 @@ class ZeroMemReader:
 # Format and training: zeromem/data/pointer_format.py, zeromem/train/finetune_pointer.py.
 # ---------------------------------------------------------------------------------------------
 POINTER_CKPT = "checkpoints/pointer/best.pt"
+MAX_ANSWER_WORDS = 70  # longer "sentences" are flattened lists/tables: never shown as an answer
 
 
 class PointerReader:
@@ -152,7 +153,14 @@ class PointerReader:
                 n = len(ids)
                 v = torch.softmax(logits[b, n - 1, [self.KNOW, self.REFUSE]], dim=-1)
                 p_know = float(v[0])
-                letters = torch.softmax(logits[b, n + 1, self.mids[:len(sents)]], dim=-1)
+                scores = logits[b, n + 1, self.mids[:len(sents)]].clone()
+                # A "sentence" of 70+ words is almost always a flattened list or table, not an answer.
+                too_long = torch.tensor([len(x.split()) > MAX_ANSWER_WORDS for x in sents])
+                if bool(too_long.all()):
+                    results[i] = ReadResult("REFUSE", None, False, "<REFUSE><DONE> (only list-like text)", secs, None, p_know)
+                    continue
+                scores[too_long] = float("-inf")
+                letters = torch.softmax(scores, dim=-1)
                 k = int(torch.argmax(letters))
                 if p_know < self.min_know:
                     results[i] = ReadResult("REFUSE", None, False, "<REFUSE><DONE>", secs, None, p_know)
