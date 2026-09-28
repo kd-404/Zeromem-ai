@@ -1,0 +1,12 @@
+.venv
+.git
+.claude
+checkpoints
+chroma_db
+logs
+build
+reports
+research_notes
+**/__pycache__
+zeromem/data/processed
+zeromem/data/raw

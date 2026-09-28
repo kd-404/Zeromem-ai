@@ -1,0 +1,14 @@
+# Render Blueprint: dashboard.render.com -> New -> Blueprint -> pick this repo.
+services:
+  - type: web
+    name: zeromem
+    runtime: docker
+    plan: free
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: MIN_KNOW          # how sure ZeroMem must be before answering (higher = refuses more)
+        value: "0.5"
+      - key: WEIGHTS_REPO      # Hugging Face model repo holding best.pt + tokenizer.json
+        value: balaji9043/zeromem-pointer
