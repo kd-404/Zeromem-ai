@@ -76,11 +76,15 @@ def build_chunk_attention_mask(chunk_ids: torch.Tensor) -> torch.Tensor:
     """Build an additive attention bias enforcing chunk isolation + causality.
 
     chunk_ids: (batch, seq_len) long tensor.
-        0   = "global" segment (system/question/answer tokens) — attends to
+        0   = "global" segment (question/answer tokens) — attends to
               everything before it, like normal causal attention.
-        >0  = a retrieved-chunk token, tagged with that chunk's id — may only
-              attend to earlier tokens carrying the SAME chunk id. This is
-              what stops chunk 1 from leaking into chunk 2's representation.
+        >0  = a retrieved-chunk token, tagged with that chunk's id — may attend
+              to earlier tokens of the SAME chunk and to earlier GLOBAL tokens
+              (the question, when it is placed first), but never to another
+              chunk. That is what stops chunk 1 leaking into chunk 2's
+              representation while still letting every chunk know what it is
+              being asked about (the Fusion-in-Decoder idea: question + one
+              passage encoded together, passages isolated from each other).
 
     Returns an additive float mask of shape (batch, 1, seq_len, seq_len):
     0.0 where attention is allowed, -inf where it is blocked. Add this
@@ -92,10 +96,11 @@ def build_chunk_attention_mask(chunk_ids: torch.Tensor) -> torch.Tensor:
     causal = torch.tril(torch.ones(t, t, dtype=torch.bool, device=device))  # (t, t)
 
     query_is_global = (chunk_ids == 0).unsqueeze(2)          # (b, t, 1) — is row i global?
+    key_is_global = (chunk_ids == 0).unsqueeze(1)            # (b, 1, t) — is column j global?
     same_chunk = chunk_ids.unsqueeze(2) == chunk_ids.unsqueeze(1)  # (b, t, t) — chunk_ids[i] == chunk_ids[j]
 
-    # Row i may see column j if: causal AND (i is global OR i,j share a chunk id)
-    allowed = causal.unsqueeze(0) & (query_is_global | same_chunk)
+    # Row i may see column j if: causal AND (i is global OR j is global OR i,j share a chunk id)
+    allowed = causal.unsqueeze(0) & (query_is_global | key_is_global | same_chunk)
 
     mask = torch.zeros(b, t, t, dtype=torch.float32, device=device)
     mask.masked_fill_(~allowed, float("-inf"))
@@ -341,3 +346,13 @@ if __name__ == "__main__":
     assert chunk1_to_chunk2 == float("-inf"), "chunk isolation broken: chunk 1 can see chunk 2"
     assert global_to_chunk2 == 0.0, "global segment should see all prior chunks"
     print("chunk isolation verified: chunk-1 cannot see chunk-2, global segment sees both")
+
+    # Question-first layout (Fusion-in-Decoder style): [question x4][chunk1 x6][chunk2 x6][answer x4]
+    fid_ids = torch.tensor([[0] * 4 + [1] * 6 + [2] * 6 + [0] * 4])
+    m = build_chunk_attention_mask(fid_ids)[0, 0]
+    assert m[6, 1].item() == 0.0, "chunk 1 tokens must see the question that comes before them"
+    assert m[12, 1].item() == 0.0, "chunk 2 tokens must see the question too"
+    assert m[12, 6].item() == float("-inf"), "chunk 2 must still NOT see chunk 1"
+    assert m[6, 12].item() == float("-inf"), "chunk 1 must not see the future / chunk 2"
+    assert m[17, 6].item() == 0.0 and m[17, 12].item() == 0.0, "answer tokens see every chunk"
+    print("question-first layout verified: chunks see the question, never each other; answer sees all")

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ZeroMem</title>
+<style>
+  :root { --bg:#0f1115; --panel:#171a21; --border:#2a2f3a; --text:#e6e8eb; --muted:#8b93a1;
+          --accent:#5b9dff; --good:#3ecf8e; --bad:#ff6b6b; --warn:#f5c04c; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+  .wrap { max-width: 760px; margin: 0 auto; padding: 32px 16px 80px; }
+  h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 24px; }
+  form { display:flex; gap:8px; margin-bottom: 24px; }
+  input[type=text] { flex:1; background:var(--panel); border:1px solid var(--border); color:var(--text);
+    padding:12px 14px; border-radius:10px; font-size:15px; outline:none; }
+  input[type=text]:focus { border-color: var(--accent); }
+  button { background: var(--accent); color:#fff; border:none; padding:0 20px; border-radius:10px;
+    font-size:15px; cursor:pointer; }
+  button:disabled { opacity:.5; cursor:default; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:14px; padding:18px 20px;
+    margin-bottom:14px; }
+  .q { color:var(--muted); font-size:13px; margin-bottom:10px; }
+  .answer { font-size:16px; line-height:1.5; margin-bottom:12px; white-space:pre-wrap; }
+  .tags { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; }
+  .tag { font-size:11px; padding:3px 9px; border-radius:999px; border:1px solid var(--border); color:var(--muted); }
+  .tag.ok { color:var(--good); border-color:var(--good); }
+  .tag.low { color:var(--warn); border-color:var(--warn); }
+  .tag.no { color:var(--bad); border-color:var(--bad); }
+  a { color: var(--accent); text-decoration:none; word-break:break-all; }
+  a:hover { text-decoration:underline; }
+  details { margin-top: 10px; }
+  summary { cursor:pointer; color:var(--muted); font-size:12px; }
+  .chunk { font-size:12px; color:var(--muted); border-top:1px solid var(--border); padding:8px 0; }
+  .chunk b { color:var(--text); }
+  .empty { color:var(--muted); font-size:14px; text-align:center; padding:40px 0; }
+  .spin { display:inline-block; width:14px; height:14px; border:2px solid var(--border);
+    border-top-color:var(--accent); border-radius:50%; animation:sp .7s linear infinite; vertical-align:-2px; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ZeroMem</h1>
+  <div class="sub">Ask a question. It searches, reads, and quotes a source — or says it can't verify one.</div>
+  <form id="f">
+    <input id="q" type="text" placeholder="e.g. Who designed the Eiffel Tower?" autofocus autocomplete="off">
+    <button id="go" type="submit">Ask</button>
+  </form>
+  <div id="feed"><div class="empty">Ask something to see ZeroMem work.</div></div>
+</div>
+<script>
+const feed = document.getElementById('feed');
+const form = document.getElementById('f');
+const input = document.getElementById('q');
+const go = document.getElementById('go');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const question = input.value.trim();
+  if (!question) return;
+  if (feed.querySelector('.empty')) feed.innerHTML = '';
+
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `<div class="q">${escapeHtml(question)}</div><div class="answer"><span class="spin"></span> thinking…</div>`;
+  feed.prepend(card);
+  input.value = ''; go.disabled = true;
+
+  try {
+    const r = await fetch('/ask', { method: 'POST', headers: {'Content-Type':'application/json'},
+                                    body: JSON.stringify({question}) });
+    const d = await r.json();
+    render(card, d);
+  } catch (err) {
+    card.querySelector('.answer').textContent = 'Request failed: ' + err;
+  } finally {
+    go.disabled = false; input.focus();
+  }
+});
+
+function render(card, d) {
+  const tags = [];
+  if (d.smalltalk) tags.push(['tag', 'ZeroMem itself']);
+  if (d.route) tags.push(['tag', 'source: ' + d.route]);
+  if (d.fell_back) tags.push(['tag warn', 'fell back to open web']);
+  if (d.answered) {
+    tags.push([d.confidence === 'verified' ? 'tag ok' : 'tag low',
+               d.confidence === 'verified' ? 'verified' : 'low confidence']);
+    if (d.picked_by) tags.push(['tag', 'picked by ' + d.picked_by]);
+    if (d.relevance !== null && d.relevance !== undefined) tags.push(['tag', 'relevance ' + d.relevance.toFixed(1)]);
+  } else if (!d.smalltalk) {
+    tags.push(['tag no', 'no verified answer']);
+  }
+  tags.push(['tag', d.seconds + 's']);
+
+  let html = '';
+  html += `<div class="q">${escapeHtml(d.question)}${d.resolved ? ' <span style="opacity:.6">→ ' + escapeHtml(d.resolved) + '</span>' : ''}</div>`;
+  html += `<div class="tags">${tags.map(([c,t]) => `<span class="${c}">${escapeHtml(t)}</span>`).join('')}</div>`;
+  html += `<div class="answer">${escapeHtml(d.text || 'No verified answer found in the sources.')}</div>`;
+  if (d.source_url) html += `<div><a href="${d.source_url}" target="_blank" rel="noopener">${d.source_url}</a></div>`;
+
+  if (d.considered && d.considered.length) {
+    html += `<details><summary>${d.considered.length} chunk(s) considered</summary>`;
+    for (const c of d.considered) {
+      html += `<div class="chunk"><b>${escapeHtml(new URL(c.url).hostname)}</b> — rerank ${c.rerank_score} — ${escapeHtml(c.verdict)}</div>`;
+    }
+    html += `</details>`;
+  }
+  card.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+}
+</script>
+</body>
+</html>

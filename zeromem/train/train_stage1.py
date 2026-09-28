@@ -107,6 +107,13 @@ def train(args: argparse.Namespace) -> None:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.max_lr, weight_decay=0.1, betas=(0.9, 0.95))
 
+    if args.init_from:
+        # Continued pretraining: start from existing WEIGHTS only (fresh optimizer, step 0, new LR schedule).
+        # Different from --resume, which restores optimizer state and the step counter of the same run.
+        init = torch.load(args.init_from, map_location=device, weights_only=False)
+        model.load_state_dict(init["model"])
+        print(f"Initialised weights from {args.init_from} (trained to step {init['step']:,}); fresh optimizer", flush=True)
+
     start_step = 0
     if args.resume:
         print(f"Resuming from checkpoint: {args.resume}")
@@ -204,6 +211,8 @@ if __name__ == "__main__":
     parser.add_argument("--data", required=True, help="Path to raw text corpus")
     parser.add_argument("--tokenizer", required=True, help="Path to trained tokenizer.json")
     parser.add_argument("--out-dir", default="checkpoints/stage1")
+    parser.add_argument("--init-from", default=None,
+                        help="start from these weights but with a fresh optimizer/step (continued pretraining on new data)")
     parser.add_argument("--resume", default=None, help="Path to a checkpoint to resume from (e.g. checkpoints/stage1/latest.pt)")
     # seq_len * batch_size MUST stay under 8192 on an 8GB M2 Pro (MPS) —
     # measured directly: 4096 tokens/step -> ~6,250-6,590 tok/s consistently;

@@ -72,7 +72,8 @@ class SemanticCache:
             results["documents"][0], results["metadatas"][0], results["distances"][0]
         ):
             similarity = 1 - dist  # chromadb cosine space returns distance = 1 - similarity
-            hits.append({"text": doc, "source_url": meta["source_url"], "similarity": similarity})
+            hits.append({"text": doc, "source_url": meta["source_url"], "similarity": similarity,
+                         "chunk_index": meta.get("chunk_index", -1)})
         return hits
 
     def lookup(
@@ -87,6 +88,13 @@ class SemanticCache:
         hits = self.query(query_text, top_k=top_k)
         good_hits = [h for h in hits if h["similarity"] >= threshold]
         return good_hits or None
+
+    def page_chunks(self, source_url: str) -> list[tuple[int, str]]:
+        """Every stored chunk of one page as (chunk_index, text), in page order. Used to show a
+        longer passage (recipes, steps) or continue reading after an answer."""
+        got = self.collection.get(where={"source_url": source_url}, include=["documents", "metadatas"])
+        rows = {(m.get("chunk_index", -1), d) for d, m in zip(got["documents"], got["metadatas"])}
+        return sorted(rows)
 
     def size(self) -> int:
         return self.collection.count()

@@ -1,99 +1,88 @@
 # ZeroMem — Blueprint
 
+A Perplexity-style answer engine that runs on one 8GB Mac, where a small transformer
+written from scratch (ZeroMem, ~34M params) is the only "brain". No LLM, no API model.
+Ask a question; it searches the web, scrapes pages, and returns a sentence quoted from a
+source with its URL, or says it could not verify an answer.
+
 Research backing this doc: [`reports/ZeroMem feasibility and prior art.md`](reports/ZeroMem%20feasibility%20and%20prior%20art.md)
 
-## What this actually is (after the prior-art check)
+## What is and isn't novel (after the prior-art check)
 
-Two of the four originally-claimed "novel" pieces already exist in published work.
-We keep them anyway because they're the right engineering choice — we just don't
-claim to have invented them.
+| Piece | Status |
+|---|---|
+| Zero-parametric-knowledge reader | Prior art: *Knowledgeless Language Models* (arXiv:2607.12831). We follow the idea; general pretraining still stores some facts (unavoidable for learning to read). |
+| Chunk-isolation attention | Prior art: Block-Attention (arXiv:2409.15355) and Fusion-in-Decoder. Implemented in `my_transformer.py`. |
+| KNOW / REFUSE / DONE control tokens | Not found published in this combination. |
+| Verify-or-refuse output rule (below) | Our design. |
 
-| Piece | Status | We're using |
-|---|---|---|
-| Zero-parametric-knowledge reader | Prior art: *Knowledgeless Language Models* (arXiv:2607.12831) | The idea, reused honestly |
-| Chunk-native attention | Prior art: **Block-Attention** (arXiv:2409.15355, ICLR 2025) | Block-Attention's actual masking scheme |
-| KNOW / UNSURE / REFUSE / DONE tokens | Not found published — genuine contribution | Built from scratch |
-| Hallucination-rate-vs-quantization-level benchmark, specifically for RAG citation groundedness | Open gap in the literature | Our headline result |
+## Hard rules
 
-## The one hard rule that keeps this project honest
+1. **Facts enter only through the context window.** Scraped text is never used to train weights.
+   Weights encode skill (reading, copying, refusing), not answers.
+2. **Verify or refuse.** A quote is shown only if (a) it is verbatim inside the chunk it was read
+   from, and (b) a cross-encoder scores it relevant to the question (>= 0; calibrated on held-out
+   data: keeps 84% of correct sentences, lets through 8% of wrong ones). Otherwise: "no verified answer".
+3. **Sanitize scraped text.** Literal control-token text (`<REFUSE>`, `<KNOW>`...) on a web page is
+   stripped before tokenizing, so a page cannot inject control tokens.
 
-**Facts only ever enter through the context window. Weights only ever encode skill.**
-
-| Event | Allowed to touch weights? | Allowed to touch the cache? |
-|---|---|---|
-| A new chunk is fetched from the internet | No | Yes — stored raw, embedded, indexed |
-| A query is answered using cached/fetched chunks | No | Read-only lookup |
-| Periodic behavior fine-tune (citation format, refusal calibration) | Yes | Reads accumulated (question, chunks, correct-answer) examples, but the *topic* is incidental — only the *skill* is the training target |
-
-If this rule is ever violated (i.e. we fine-tune on "new facts" directly), the project
-stops being ZeroMem and becomes a normal small LM with a stale knowledge cutoff —
-exactly what it's designed to avoid. Any PR that blurs this gets rejected.
-
-## Pipeline
+## Pipeline (as built: `python -m zeromem.pipeline "question"`)
 
 ```
-User query
-   │
-   ▼
-Qwen2.5-3B-Q4 (agent brain, mlx-lm)  ─── decides: answer directly / call ZeroMem
-   │
-   ▼
-ZeroMem tool call
-   │
-   ├─▶ 1. Embed query (bge-small-en) → similarity search against local ChromaDB cache
-   │
-   ├─▶ 2. Cache hit (similar-enough past query) → skip web, use stored chunks
-   │
-   ├─▶ 3. Cache miss → Brave Search API → fetch pages (trafilatura) → chunk →
-   │       embed → STORE in ChromaDB (permanent) → use these chunks
-   │
-   ▼
-ZeroMem reader (our from-scratch transformer)
-   - reads top-K reranked chunks (cross-encoder rerank first)
-   - chunk-native attention: chunks can't attend to each other, only the
-     query/answer segment attends to all of them (Block-Attention scheme)
-   - emits KNOW / UNSURE / REFUSE token + cited answer
-   │
-   ▼
-Qwen2.5-3B synthesizes final response with citations
-   │
-   ▼
-User sees answer + sources
+question
+  1. cache     bge-small + ChromaDB: reuse chunks we already fetched
+  2. search    ddgs (no key) | brave | tavily | exa          zeromem/scraper/search.py
+  3. scrape    parallel fetch, trafilatura, 120-word chunks   zeromem/scraper/fetch.py
+  4. store     new chunks embedded into the cache (grows over time)
+  5. rerank    MiniLM cross-encoder picks the top-k chunks
+  6. read      ZeroMem reads each top chunk: <KNOW>[1] sentence<DONE> or <REFUSE><DONE>
+                 -> quote must be verbatim in the chunk AND relevant to the question
+  7. answer    verified quote + source URL, or "no verified answer"
 ```
 
-## Components and where they live
+## Status
 
-| Component | Path | Status |
+| Component | Path | State |
 |---|---|---|
-| Transformer architecture | `zeromem/model/my_transformer.py` | building now |
-| Tokenizer (BPE, custom special tokens) | `zeromem/tokenizer/train_tokenizer.py` | building now |
-| Web fetch + chunk | `zeromem/scraper/fetch.py` | building now |
-| Semantic cache (ChromaDB) | `zeromem/cache/vector_store.py` | building now |
-| Stage-1 training (TinyStories, general fluency) | `zeromem/train/train_stage1.py` | next |
-| Stage-2 fine-tune (citation/refusal skill) | `zeromem/train/train_stage2.py` | later — needs synthetic data pipeline |
-| Agent orchestration (Qwen brain + tool calling) | `zeromem/agent/` | later |
-| Eval harness (hallucination vs. quantization) | `zeromem/eval/` | later |
-| API / UI | `zeromem/api/` | later |
+| Transformer (RoPE, RMSNorm, SwiGLU, chunk masks) | `zeromem/model/my_transformer.py` | done, tested |
+| Tokenizer (byte BPE, 16k, 8 reserved control tokens) | `zeromem/tokenizer/` | done |
+| Stage 1: TinyStories (fluent English) | `zeromem/train/train_stage1.py` | done, val loss 1.59 |
+| Reading practice: Simple Wikipedia (`--init-from`) | same script | done, held-out loss 8.24 -> 2.11 |
+| "Arrange" task dataset (SQuAD 2.0 reshaped) | `zeromem/data/build_arrange_dataset.py` | done, labels verified |
+| Arrange fine-tune | `zeromem/train/finetune_arrange.py` | in progress (see findings) |
+| Search, scrape, cache, rerank, reader, pipeline | `zeromem/scraper/`, `cache/`, `reader.py`, `pipeline.py` | built and run end to end |
+| Evaluation harness (generation-based, per question) | `zeromem/eval/` | not built yet |
+| API / UI | | not started |
 
-## Special tokens (reserved in tokenizer at training time — never resize embeddings later)
+## Measured findings (do not lose these)
 
-`<PAD>` `<BOS>` `<EOS>` `<CHUNK_SEP>` `<KNOW>` `<UNSURE>` `<REFUSE>` `<DONE>`
+- **Story-only ZeroMem cannot do the job.** After arrange fine-tuning it answered every question with
+  the same sentence, and its quotes were corrupted copies. Loss looked fine; behavior did not.
+  Always judge with `python -m zeromem.train.ask_arrange --demo`, not with loss alone.
+- **Reading practice fixed copying**: quotes became exact verbatim sentences.
+- **Still open: matching the question to the right sentence.** The pretrained MiniLM reranker gets
+  86.6% top-1 sentence selection on our validation set; ZeroMem's teacher-forced metrics were at
+  chance. The pipeline's relevance check protects against wrong-but-real quotes in the meantime.
+- Summary metrics can mislead: "quote-start accuracy" mostly measured the habit of starting with "The".
+- A model can use shortcuts: with short chunks it refused everything (it learned "short = junk page").
 
-## Model config (v1 target — tune after first training run)
+## Machine lessons (8GB M2 Pro, MPS)
 
-- vocab_size: 16384
-- d_model: 512
-- n_layers: 8
-- n_heads: 8 (head_dim 64)
-- d_ff: 1408 (SwiGLU)
-- max_seq_len: 2048
-- rope_theta: 10000.0
-- ~34M params, tied embeddings
+- Keep batch_size x seq_len under ~8,192 tokens/step: above it throughput collapses ~36x.
+- Every batch must have one fixed tensor shape, or the process balloons in memory and thrashes.
+- Explicit-mask attention at ~1,000 tokens is memory-heavy; use small micro-batches + accumulation.
+- Closing the lid sleeps the Mac regardless of `caffeinate` (needs an external display).
+- Quit heavy apps (VS Code held ~4GB) before long runs; the run slows down under memory pressure.
 
-## Known risks carried forward from research (see full report for detail)
+## Removed
 
-1. Refusal-following behavior at 30M params is untested in the literature at this scale — validate early with a small synthetic refusal set before committing to the full pipeline.
-2. Chunk-native attention masking may need fine-tuning to avoid accuracy loss (Block-Attention saw ~20pt drop pre-tuning) — budget for this, don't assume zero-shot masking works.
-3. DONE-token stopping alone is flagged unreliable in 2026 literature — pair it with a max-hops safety cap in the orchestrator, never trust DONE alone.
-4. MPS training memory/time is unbenchmarked at this exact scale — expect to tune batch size empirically, don't pre-commit to a training-time estimate.
-5. Cache contamination: a wrong fetched chunk is cheap to fix (delete from cache); a wrong chunk baked into a stage-2 fine-tune is not — always keep a manual review/filter step before stage-2 data goes into training.
+The Qwen "agent brain" was dropped from the plan. The 4-bit weights remain in the Hugging Face
+cache (~1.7GB) and `mlx-lm` is no longer a requirement.
+
+## Next
+
+1. Finish the one-chunk arrange fine-tune from the reading-practice weights; judge it with the demo prompts.
+2. Build a generation-based evaluation: over N held-out questions, how often does ZeroMem's quote equal
+   the gold sentence, how often is it verified, relevant, and refused correctly (vs. the reranker alone).
+3. If matching is learned: extend to multi-chunk. If not: more reading practice, then a bigger model.
+4. UNSURE token data (partial evidence), API and UI.
