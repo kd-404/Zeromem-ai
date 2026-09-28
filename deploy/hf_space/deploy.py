@@ -1,7 +1,7 @@
 """Build and publish ZeroMem as a Hugging Face Space (Docker, free CPU tier).
 
 One-time setup on your Mac (inside the project's .venv):
-    pip install -U huggingface_hub
+    pip install "huggingface_hub>=1.5,<2.0"
     hf auth login            # paste a token with WRITE access: huggingface.co/settings/tokens
 
 Then, from the project root (the folder that contains zeromem/ and checkpoints/):
@@ -85,7 +85,7 @@ def main() -> None:
     try:
         from huggingface_hub import HfApi
     except ImportError:
-        sys.exit("pip install -U huggingface_hub   (then: hf auth login)")
+        sys.exit("pip install "huggingface_hub>=1.5,<2.0"   (then: hf auth login)")
     api = HfApi()
     try:
         who = api.whoami()["name"]
