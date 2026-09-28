@@ -255,4 +255,49 @@ print("zeromem-only follow-up:", repr(b.resolved), "->", b.text[:45])
 log.clear(); c = p.ask("next")
 assert c.continued and c.answered and not log, c
 print("zeromem-only 'next': continued the same page, no new search")
+
+# ---- the reported Suriya conversation: topic kept across follow-ups, most confident pick wins ----
+from zeromem.pipeline import subject_of, resolve_followup, clock_reply
+assert subject_of("Who designed the Eiffel Tower?") == "the Eiffel Tower", subject_of("Who designed the Eiffel Tower?")
+assert subject_of("who is he actually?") == "he"
+assert resolve_followup("who build that?", "Who designed the Eiffel Tower?") == "who build the Eiffel Tower?"
+SURIYA = ("They have two children: a daughter (Diya; born 2007) and a son (Dev; born 2010). "
+          "Suriya was born as Saravanan on 23 July 1975 in Madras, to actor Sivakumar. "
+          "Suriya is married to the actress Jyothika. He is among the highest paid actors in Tamil cinema. ") * 2
+def suriya_wiki(q):
+    log.append(("wiki", q))
+    return [Chunk(SURIYA, "https://en.wikipedia.org/wiki/Suriya", 0),
+            Chunk("Suriya appeared in 24 in 2016. " * 12, "https://en.wikipedia.org/wiki/Suriya_filmography", 0)], 2, Counter()
+class ConfidentReader:  # chunk 1 (filmography) gets a weak pick, the real answer is in chunk 2 with high confidence
+    def read_many(s, q, texts):
+        out = []
+        for t in texts:
+            if "born" in q and "Saravanan" in t:
+                out.append(types.SimpleNamespace(verdict="KNOW", quote="Suriya was born as Saravanan on 23 July 1975 in Madras, to actor Sivakumar.", verified=True, raw="", seconds=0.1, pick="B", prob=0.91))
+            elif "wife" in q and "Jyothika" in t:
+                out.append(types.SimpleNamespace(verdict="KNOW", quote="Suriya is married to the actress Jyothika.", verified=True, raw="", seconds=0.1, pick="C", prob=0.88))
+            else:
+                first = t.split(". ")[0].strip() + "."
+                out.append(types.SimpleNamespace(verdict="KNOW", quote=first, verified=True, raw="", seconds=0.1, pick="A", prob=0.55))
+        return out
+class RankFilmFirst:  # the ranker puts the weaker chunk first, like in the log
+    def predict(s, pairs, show_progress_bar=False): return [5.0 if "appeared in 24" in t else 1.0 for _, t in pairs]
+P.wiki_chunks = suriya_wiki
+p = mk(); p.zeromem_only = True; p._reader, p._reranker = ConfidentReader(), RankFilmFirst()
+p.ask("who is actor suriya?")
+b = p.ask("who is he actually?")
+assert b.resolved == "who is actor suriya actually?", b.resolved
+c = p.ask("who is his wife?")
+assert c.resolved == "who is actor suriya's wife?" and "Jyothika" in c.text, (c.resolved, c.text)
+d = p.ask("when was he born>")
+assert d.resolved == "when was actor suriya born", d.resolved
+assert "23 July 1975" in d.text, d.text
+print("suriya chain:", repr(c.resolved), "->", c.text[:32], "|", repr(d.resolved), "->", d.text[:40])
+
+a = clock_reply("what day is today/")
+assert a and "Today is" in a, a
+assert clock_reply("what day comes after monday in a week") is None
+log.clear(); t = mk().ask("what day is today/")
+assert t.smalltalk and "Today is" in t.text and not log, (t, log)
+print("clock:", t.text[:40])
 print("\nALL TESTS PASSED")

@@ -51,8 +51,25 @@ INTRO = ("I'm ZeroMem, a small language model built from scratch. I don't answer
 
 def clean_question(q: str) -> str:
     """Trim stray characters people type by accident (trailing slashes, repeated punctuation)."""
-    q = q.strip().strip("/\\|~`")
+    q = q.strip().strip("/\\|~`<>")
     return re.sub(r"[?!.]{2,}$", "?", q).strip()
+
+
+_CLOCK = re.compile(r"^(what('?s| is)?\s+)?(the\s+)?(today'?s?\s+)?(date|day|time|year|month)(\s+is\s+(it|today|now))?"
+                    r"(\s+(today|now|right now))?$|^(what )?(day|date) (is it|is today)( today)?$|^today'?s? date$|"
+                    r"^current (date|time|day)$", re.I)
+
+
+def clock_reply(q: str) -> str | None:
+    """'what day is today', 'what time is it', 'today's date': answered from this computer's
+    clock, not a web search (search engines return news pages for these)."""
+    t = re.sub(r"[^a-z' ]", "", q.lower()).strip()
+    if not _CLOCK.match(t):
+        return None
+    import datetime
+    now = datetime.datetime.now().astimezone()
+    return (f"Today is {now:%A, %d %B %Y}, and the time is {now:%H:%M} ({now:%Z}). "
+            "This comes from this computer's clock, not from a web source.")
 
 
 def small_talk_reply(q: str) -> str | None:
@@ -63,7 +80,7 @@ def small_talk_reply(q: str) -> str | None:
         return "Please type a question."
     if _ABOUT_ME.match(t) or _GREETING.match(t):
         return INTRO
-    return None
+    return clock_reply(q)
 MAX_CHUNKS_PER_PAGE = 40
 # Backup answers: when ZeroMem gives no verified answer, the best real sentence from the top chunks
 # is still shown (labelled LOW CONFIDENCE) if the cross-encoder scores it above this. 0 is its
@@ -109,21 +126,35 @@ def is_continue(q: str) -> bool:
     return bool(_CONTINUE.match(re.sub(r"[^a-z' ]", "", q.lower()).strip()))
 
 
+_LEAD_VERB = re.compile(r"^(?:(?:is|was|are|were|did|does|do|has|have|had|designed|built|build|made|make|wrote|write|"
+                        r"invented|founded|discovered|created|directed|painted|composed|won|owns|runs|leads|"
+                        r"played|starred|sang|cook|prepare|create|use|install|fix|get|to)\s+)+", re.I)
+_FILLER = re.compile(r"\b(actually|really|exactly|basically|currently|now|please|again)\b", re.I)
+
+
 def subject_of(question: str) -> str:
-    """The thing a question is about: 'who is rajinikanth' -> 'rajinikanth',
-    'how to make rasam' -> 'rasam'."""
+    """The thing a question is about, as a short noun phrase:
+    'who is rajinikanth' -> 'rajinikanth', 'how to make rasam' -> 'rasam',
+    'who designed the Eiffel Tower' -> 'the Eiffel Tower' (leading verbs dropped),
+    'who is he actually' -> filler words like 'actually' dropped."""
     from zeromem.scraper.router import search_query
     s = search_query(question)
-    s = re.sub(r"^(how\s+)?(to\s+)?(make|cook|prepare|do|build|create|write|get|use|install|fix)\s+", "", s, flags=re.I)
-    return s.strip(" ?.!") or question
+    s = re.sub(r"^how\s+", "", s, flags=re.I)
+    s = _LEAD_VERB.sub("", s)
+    s = _FILLER.sub("", s)
+    s = " ".join(s.split()).strip(" ?.!,<>/")
+    return s or question
 
 
-def resolve_followup(question: str, last_question: str | None) -> str | None:
+def resolve_followup(question: str, last_question: str | None, topic: str | None = None) -> str | None:
     """'when was he born' after 'who is rajinikanth' -> 'when was rajinikanth born'. Only short
-    questions with a pronoun count, so a new full question is never rewritten."""
-    if not last_question or len(question.split()) > 8 or not _PRONOUN.search(question):
+    questions with a pronoun count, so a new full question is never rewritten.
+    `topic` is the subject the conversation is about (kept across several follow-ups, so
+    'his wife' then 'when was he born' both refer to the same person); without it, the
+    subject of `last_question` is used."""
+    if not (topic or last_question) or len(question.split()) > 8 or not _PRONOUN.search(question):
         return None
-    subj = subject_of(last_question)
+    subj = topic or subject_of(last_question)
     if not subj or subj.lower() in question.lower():
         return None
     first = [True]
@@ -226,7 +257,8 @@ class Pipeline:
         self.min_relevance = min_relevance
         self._ckpt, self._device, self._cache_dir = ckpt, device, cache_dir
         self._reader = self._reranker = self._cache = None
-        self.last: dict | None = None  # previous answer: question, url, page text, where it ended
+        self.last: dict | None = None  # previous answer: question, url, page text, where it ended, topic
+        self._topic: str | None = None
 
     # -- lazy loading: don't pay for a model until a step needs it ----------
     @property
@@ -323,6 +355,7 @@ class Pipeline:
         top = sorted(zip(scores, chunks), key=lambda x: -x[0])[: self.k]
         self._say(f"[4/5] reranked {len(chunks)} chunks, reading the top {len(top)} ({time.time() - t:.1f}s)")
         backup: list[tuple[float, str, str, str]] = []  # (relevance, sentence, url, picked_by)
+        verified: list[tuple[dict, float | None]] = []
         reads = self._read_all(question, [c.text for _, c in top])
         for rank, ((score, chunk), r) in enumerate(zip(top, reads), 1):
             accepted = False
@@ -340,7 +373,13 @@ class Pipeline:
             considered.append((chunk.source_url, float(score), note))
             self._say(f"   chunk {rank}: rerank {score:+.1f} | ZeroMem: {note} | {urlparse(chunk.source_url).netloc} ({r.seconds:.1f}s)")
             if accepted:
-                return {"text": r.quote, "url": chunk.source_url, "confidence": "verified", "picked_by": "zeromem", "relevance": rel}
+                verified.append(({"text": r.quote, "url": chunk.source_url, "confidence": "verified",
+                                  "picked_by": "zeromem", "relevance": rel}, getattr(r, "prob", None)))
+                if getattr(r, "prob", None) is None:
+                    break  # copy model: no confidence score, so the first verified answer wins (as before)
+        if verified:
+            # pointer model: every chunk was read in one pass, so take its most confident verified pick
+            return max(verified, key=lambda v: v[1] or 0.0)[0]
 
         # Backup: the reranker scores every whole sentence in the chunks ZeroMem just read.
         sents = [(snt, c.source_url) for _, c in top for snt in sentences(c.text)]
@@ -403,6 +442,7 @@ class Pipeline:
         """ZeroMem reads the top-k chunks; its own output is the answer. The reranker only
         decides which chunks ZeroMem reads first (a search step, not a judge)."""
         norm = lambda x: " ".join(x.split())  # same whitespace rule as reader.norm
+        first = len(readings)  # readings from earlier calls (cache, routed source) aren't re-judged here
         t = time.time()
         chunks = [c for c in chunks if not is_code_chunk(c.text)] or chunks
         scores = self.reranker.predict([(question, c.text) for c in chunks], show_progress_bar=False)
@@ -423,10 +463,14 @@ class Pipeline:
                          (f" p={r.prob:.2f}" if getattr(r, "prob", None) is not None else ""))
                       + (f" [{mark}]: {item['text']}" if r.verdict != "REFUSE" else "") + f" ({r.seconds:.1f}s)")
         # Its best reading: a quote found in the page, else any quote it wrote, else raw output.
+        # Within each group, the pointer model's most confident reading (highest P(KNOW)) wins;
+        # the copy model has no confidence, so its first reading in rank order wins.
+        mine = readings[first:]
         for want in (lambda x: x["verdict"] == "KNOW" and x["in_source"],
                      lambda x: x["verdict"] == "KNOW" and x["text"],
                      lambda x: x["verdict"] == "MALFORMED" and x["text"]):
-            pick = next((x for x in readings if want(x)), None)
+            group = [x for x in mine if want(x)]
+            pick = max(group, key=lambda x: x.get("prob") or 0.0) if group else None
             if pick:
                 return {"text": pick["text"], "url": pick["url"], "picked_by": "zeromem", "relevance": None,
                         "confidence": "in-source" if pick["in_source"] else "not-in-source"}
@@ -443,7 +487,7 @@ class Pipeline:
                 if at < 0:
                     page, at = hit["text"], 0
                 self.last = {"question": question, "url": hit["url"], "page": page, "end": at + len(hit["text"]),
-                             "confidence": hit["confidence"], "picked_by": "zeromem"}
+                             "confidence": hit["confidence"], "picked_by": "zeromem", "topic": self._topic}
                 ans = Answer(question, True, hit["text"], hit["url"], [], time.time() - t_all, route=route,
                              fell_back=fell_back, confidence=hit["confidence"], picked_by="zeromem", readings=readings,
                              resolved=resolved)
@@ -497,10 +541,13 @@ class Pipeline:
         # page, and short follow-ups get the previous subject ("his wife" -> "actor vijay's wife").
         if self.last and is_continue(question):
             return self._continue(question, t_all)
-        resolved = resolve_followup(question, self.last["question"] if self.last else None)
+        last_topic = self.last.get("topic") if self.last else None
+        resolved = resolve_followup(question, self.last["question"] if self.last else None, last_topic)
         if resolved:
             self._say(f"[follow-up] {question!r} -> {resolved!r}")
             question = resolved
+        # A follow-up stays on the conversation's topic; a new question starts a new topic.
+        self._topic = (last_topic or subject_of(self.last["question"])) if resolved else subject_of(question)
         if self.zeromem_only:
             return self._ask_zeromem(question, t_all, resolved)
         considered: list[tuple[str, float, str]] = []
@@ -517,7 +564,7 @@ class Pipeline:
                 else:
                     end = at + len(hit["text"])
                 self.last = {"question": question, "url": hit["url"], "page": page, "end": end,
-                             "confidence": hit["confidence"], "picked_by": hit["picked_by"]}
+                             "confidence": hit["confidence"], "picked_by": hit["picked_by"], "topic": self._topic}
                 ans = Answer(question, True, hit["text"], hit["url"], considered, time.time() - t_all, route=route,
                              fell_back=fell_back, confidence=hit["confidence"], picked_by=hit["picked_by"],
                              relevance=hit["relevance"], resolved=resolved)
