@@ -292,6 +292,10 @@ assert c.resolved == "who is actor suriya's wife?" and "Jyothika" in c.text, (c.
 d = p.ask("when was he born>")
 assert d.resolved == "when was actor suriya born", d.resolved
 assert "23 July 1975" in d.text, d.text
+# person pronouns only follow a person topic; it/they only a thing
+assert resolve_followup("where is it located?", "Who is the CEO (Chief Executive Officer)?") is None
+assert resolve_followup("what do they manufacture?", "Who is the CEO?") is None
+assert resolve_followup("when was she born", "who is sangeetha") == "when was sangeetha born"
 print("suriya chain:", repr(c.resolved), "->", c.text[:32], "|", repr(d.resolved), "->", d.text[:40])
 
 a = clock_reply("what day is today/")

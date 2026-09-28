@@ -119,13 +119,14 @@ class DocIndex:
         """The file behind a doc:// link (only files that were loaded, so no path tricks)."""
         return self._by_name.get(name)
 
-    def search(self, question: str, n: int = 40) -> list[Chunk]:
+    def search(self, question: str, n: int = 60) -> list[Chunk]:
         if not self.chunks:
             return []
         scores = self.ranker.predict([(question, c.text) for c in self.chunks])
         order = sorted(range(len(self.chunks)), key=lambda i: -scores[i])
-        top = [self.chunks[i] for i in order[:n] if scores[i] > 0]
-        return top or [self.chunks[i] for i in order[:n]]  # no keyword overlap: let the ranker/ZeroMem judge
+        # Keywords only TRIM large collections; they never decide. A chunk without the question's exact
+        # words (a synonym, a typo like "manufacuture") still reaches the ranker and ZeroMem.
+        return [self.chunks[i] for i in order[:n]]
 
     def summary(self) -> str:
         pages = sum(f.pages for f in self.files)
