@@ -232,4 +232,27 @@ p = mk(); p.zeromem_only = True; p._reader, p._reranker = RasamReader(), FakeRer
 a = p.ask("Who designed the Eiffel Tower?")
 assert not a.answered and a.readings and all(r["verdict"] == "REFUSE" for r in a.readings)
 print("zeromem-only: all REFUSE -> no answer, and no reranker backup")
+
+# ---- zeromem-only keeps the conversation: follow-ups and "next" (was broken: both modes must work) ----
+VIJAY = ("Vijay is an Indian actor and politician who works in Tamil cinema. He is married to Sangeetha "
+         "Sornalingam, a Sri Lankan Tamil. They have two children. Vijay founded a political party in 2024. " * 3)
+def vijay_wiki(q):
+    log.append(("wiki", q))
+    return [Chunk(VIJAY, "https://en.wikipedia.org/wiki/C._Joseph_Vijay", 0)], 1, Counter()
+class VijayReader:
+    def read(s, q, t):
+        want = "married" if "wife" in q else "Indian actor"
+        sent = next(x.strip() + "." for x in t.split(".") if want in x)
+        return types.SimpleNamespace(verdict="KNOW", quote=sent, verified=True, raw="", seconds=0.1)
+P.wiki_chunks = vijay_wiki
+p = mk(); p.zeromem_only = True; p._reader, p._reranker = VijayReader(), FakeRerank()
+log.clear(); a = p.ask("who is actor vijay")
+b = p.ask("who is his wife?")
+assert b.resolved and "actor vijay" in b.resolved.lower(), b.resolved
+assert any(k == "wiki" and "vijay" in q.lower() for k, q in log[1:]), log
+assert "married" in b.text.lower() and "Vijay" in b.source_url, b.text
+print("zeromem-only follow-up:", repr(b.resolved), "->", b.text[:45])
+log.clear(); c = p.ask("next")
+assert c.continued and c.answered and not log, c
+print("zeromem-only 'next': continued the same page, no new search")
 print("\nALL TESTS PASSED")

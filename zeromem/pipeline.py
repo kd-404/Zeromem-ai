@@ -432,18 +432,26 @@ class Pipeline:
                         "confidence": "in-source" if pick["in_source"] else "not-in-source"}
         return None
 
-    def _ask_zeromem(self, question: str, t_all: float) -> Answer:
+    def _ask_zeromem(self, question: str, t_all: float, resolved: str | None = None) -> Answer:
         readings: list[dict] = []
+        pool: list[Chunk] = []  # every chunk seen, to rebuild the answer's page for "next"
 
         def done(hit: dict | None, route: str, fell_back: bool = False) -> Answer:
             if hit:
+                page = self._page(hit["url"], pool)
+                at = page.find(hit["text"])
+                if at < 0:
+                    page, at = hit["text"], 0
+                self.last = {"question": question, "url": hit["url"], "page": page, "end": at + len(hit["text"]),
+                             "confidence": hit["confidence"], "picked_by": "zeromem"}
                 ans = Answer(question, True, hit["text"], hit["url"], [], time.time() - t_all, route=route,
-                             fell_back=fell_back, confidence=hit["confidence"], picked_by="zeromem", readings=readings)
+                             fell_back=fell_back, confidence=hit["confidence"], picked_by="zeromem", readings=readings,
+                             resolved=resolved)
                 self._say(f"\nZEROMEM SAYS: {ans.text}  [{ans.confidence}]\nSOURCE: {ans.source_url}   "
                           f"[{route}] ({ans.seconds:.1f}s total)")
             else:
                 ans = Answer(question, False, seconds=time.time() - t_all, route=route, fell_back=fell_back,
-                             readings=readings)
+                             readings=readings, resolved=resolved)
                 self._say(f"\nZeroMem refused every chunk it read. ({ans.seconds:.1f}s total)")
             return ans
 
@@ -451,7 +459,9 @@ class Pipeline:
             hits = self.cache.lookup(question, top_k=20, threshold=self.cache_threshold)
             if hits and len(hits) >= self.k:
                 self._say(f"[1/5] cache HIT: {len(hits)} stored chunks")
-                hit = self._zeromem_read(question, [Chunk(h["text"], h["source_url"], h.get("chunk_index", -1)) for h in hits], readings)
+                cached = [Chunk(h["text"], h["source_url"], h.get("chunk_index", -1)) for h in hits]
+                pool += cached
+                hit = self._zeromem_read(question, cached, readings)
                 if hit and hit["confidence"] == "in-source":
                     return done(hit, "cache")
                 self._say("      no in-source answer from the cache, searching fresh")
@@ -461,6 +471,7 @@ class Pipeline:
         self._say(f"[2/5] route: {route.name.upper()} ({route.why})")
         self._say(f"[3/5] retrieving from {route.name}")
         chunks = self._retrieve(question, route)
+        pool += chunks
         self._store(chunks)
         hit = self._zeromem_read(question, chunks, readings) if chunks else None
         if (hit and hit["confidence"] == "in-source") or route.name == "web":
@@ -468,6 +479,7 @@ class Pipeline:
         self._say(f"      trying the open web too")
         seen = {c.text for c in chunks}
         web = [c for c in self._web_pages(question) if c.text not in seen]
+        pool += web
         self._store(web)
         web_hit = self._zeromem_read(question, web, readings) if web else None
         best = web_hit if (web_hit and (web_hit["confidence"] == "in-source" or not hit)) else hit
@@ -481,15 +493,16 @@ class Pipeline:
         if msg:
             self._say(f"\n[no search] {msg}")
             return Answer(question, False, text=msg, smalltalk=True, seconds=time.time() - t_all)
-        if self.zeromem_only:
-            return self._ask_zeromem(question, t_all)
-        # "next" / "more": keep reading the previous answer's page
+        # Conversation first, in BOTH modes: "next" / "more" keeps reading the previous answer's
+        # page, and short follow-ups get the previous subject ("his wife" -> "actor vijay's wife").
         if self.last and is_continue(question):
             return self._continue(question, t_all)
         resolved = resolve_followup(question, self.last["question"] if self.last else None)
         if resolved:
             self._say(f"[follow-up] {question!r} -> {resolved!r}")
             question = resolved
+        if self.zeromem_only:
+            return self._ask_zeromem(question, t_all, resolved)
         considered: list[tuple[str, float, str]] = []
         pool: list[Chunk] = []  # every chunk seen for this question, to rebuild the answer's page
 
