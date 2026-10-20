@@ -1,6 +1,5 @@
 .venv
 .git
-.claude
 checkpoints
 chroma_db
 logs

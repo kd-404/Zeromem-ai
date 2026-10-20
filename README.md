@@ -1,6 +1,6 @@
 # ZeroMem
 
-A Perplexity-style answer engine where the "brain" is a transformer I wrote from scratch — about 34M parameters, trained and run on one 8GB M2 Pro Mac. No GPT, no Claude, no API model anywhere in the loop.
+A Perplexity-style answer engine where the "brain" is a transformer I wrote from scratch — about 34M parameters, trained and run on one 8GB M2 Pro Mac. No GPT, no hosted LLM API, nothing but this from-scratch model in the loop.
 
 Ask it something. It searches the web, scrapes a few pages, and gives you back one sentence copied **word for word** from a source, plus the link. If nothing it found actually answers the question, it says so instead of guessing.
 
